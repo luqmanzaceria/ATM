@@ -212,7 +212,10 @@ class BCViLTPolicy(nn.Module):
     # _setup_policy_head with intermediate outputs
     def _setup_policy_head(self, network_name, **policy_head_kwargs):
         # Calculate the new input size including intermediate representations
-        intermediate_size = self.track.transformer.layers[0][0].attn.in_proj_weight.shape[1] * len(self.track.transformer.layers) * 2  # Assuming 2 sublayers per transformer layer
+        attention_dim = self.track.transformer.layers[0][0].to_q.in_features
+        num_layers = len(self.track.transformer.layers)
+        intermediate_size = attention_dim * num_layers * 2  # Assuming 2 sublayers per transformer layer
+        
         policy_head_kwargs["input_size"] = (
             self.temporal_embed_size 
             + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
@@ -224,7 +227,7 @@ class BCViLTPolicy(nn.Module):
         self.out_shape = np.prod(action_shape)
         policy_head_kwargs["output_size"] = self.out_shape
         self.policy_head = eval(network_name)(**policy_head_kwargs)
-
+        
     @torch.no_grad()
     def preprocess(self, obs, track, action):
         """
@@ -702,8 +705,24 @@ class BCViLTPolicy(nn.Module):
     def save(self, path):
         torch.save(self.state_dict(), path)
 
+    # def load(self, path):
+    #     self.load_state_dict(torch.load(path, map_location="cpu"))
+
     def load(self, path):
-        self.load_state_dict(torch.load(path, map_location="cpu"))
+        state_dict = torch.load(path, map_location="cpu")
+        model_state_dict = self.state_dict()
+        
+        # Filter out mismatched keys
+        filtered_state_dict = {k: v for k, v in state_dict.items() if k in model_state_dict and v.shape == model_state_dict[k].shape}
+        
+        # Update model state dict
+        model_state_dict.update(filtered_state_dict)
+        
+        # Load the filtered state dict
+        self.load_state_dict(model_state_dict, strict=False)
+        
+        print(f"Loaded checkpoint from {path}")
+        print(f"Missed keys: {set(model_state_dict.keys()) - set(filtered_state_dict.keys())}")
 
     def train(self, mode=True):
         super().train(mode)
