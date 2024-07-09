@@ -170,38 +170,72 @@ class TrackTransformer(nn.Module):
         mask_track[:, 1:] = track[:, [0]]
         return mask_track
 
+    # def forward(self, vid, track, task_emb, p_img):
+    #     """
+    #     track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
+    #     vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
+    #     task_emb, (b, emb_size)
+    #     """
+    #     assert torch.max(vid) <=1.
+    #     B, T, _, _ = track.shape
+    #     patches = self._encode_video(vid, p_img)  # (b, n_image, d)
+    #     enc_track = self._encode_track(track)
+
+    #     text_encoded = self.language_encoder(task_emb)  # (b, c)
+    #     text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
+
+    #     x = torch.cat([enc_track, patches, text_encoded], dim=1)
+    #     x = self.transformer(x)
+
+    #     rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+    #     rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+    #     rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+    #     num_track_h = self.num_track_ts // self.track_patch_size
+    #     rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
+
+    #     # return rec_track, rec_patches
+    #     return rec_track, rec_patches, intermediate_outputs
+
+    # def reconstruct(self, vid, track, task_emb, p_img):
+    #     """
+    #     wrapper of forward with preprocessing
+    #     track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
+    #     vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
+    #     task_emb: (b, e)
+    #     """
+    #     assert len(vid.shape) == 5  # b, t, c, h, w
+    #     track = self._preprocess_track(track)
+    #     vid = self._preprocess_vid(vid)
+    #     return self.forward(vid, track, task_emb, p_img)
+
+    # forward and reconstruct with intermediate outputs
     def forward(self, vid, track, task_emb, p_img):
-        """
-        track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
-        vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
-        task_emb, (b, emb_size)
-        """
         assert torch.max(vid) <=1.
         B, T, _, _ = track.shape
         patches = self._encode_video(vid, p_img)  # (b, n_image, d)
         enc_track = self._encode_track(track)
-
+    
         text_encoded = self.language_encoder(task_emb)  # (b, c)
         text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
-
+    
         x = torch.cat([enc_track, patches, text_encoded], dim=1)
-        x = self.transformer(x)
-
+        
+        intermediate_outputs = []
+        for layer in self.transformer.layers:
+            x = layer[0](x) + x  # attention layer
+            intermediate_outputs.append(x.clone())
+            x = layer[1](x) + x  # feedforward layer
+            intermediate_outputs.append(x.clone())
+        
         rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
         rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
         rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
         num_track_h = self.num_track_ts // self.track_patch_size
         rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
-
-        return rec_track, rec_patches
-
+        
+        return rec_track, rec_patches, intermediate_outputs
+    
     def reconstruct(self, vid, track, task_emb, p_img):
-        """
-        wrapper of forward with preprocessing
-        track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
-        vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
-        task_emb: (b, e)
-        """
         assert len(vid.shape) == 5  # b, t, c, h, w
         track = self._preprocess_track(track)
         vid = self._preprocess_vid(vid)

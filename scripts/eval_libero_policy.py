@@ -7,7 +7,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # input parameters
 parser = argparse.ArgumentParser()
-parser.add_argument("--suite", default="libero_goal", choices=["libero_spatial", "libero_object", "libero_goal", "libero_10"], 
+parser.add_argument("--suite", default="libero_goal", choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "mini_libero_spatial"], 
                     help="The name of the desired suite, where libero_10 is the alias of libero_long.")
 parser.add_argument("--exp-dir", required=True, help="The path to the folder of trained policy.")
 args = parser.parse_args()

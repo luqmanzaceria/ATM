@@ -265,7 +265,8 @@ def main(root, save, suite, skip_exist):
     suite_dir = os.path.join(root, suite)
 
     # setup cotracker
-    cotracker = torch.hub.load(os.path.join(os.path.expanduser("~"), ".cache/torch/hub/facebookresearch_co-tracker_main/"), "cotracker2", source="local")
+    # cotracker = torch.hub.load(os.path.join(os.path.expanduser("~"), ".cache/torch/hub/facebookresearch_co-tracker_main/"), "cotracker2", source="local")
+    cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker2")
     cotracker = cotracker.eval().cuda()
 
     # load task name embeddings

@@ -22,6 +22,11 @@ from atm.utils.log_utils import MetricLogger, BestAvgLoss
 from atm.utils.env_utils import build_env
 from engine.utils import rollout, merge_results
 
+# FOR VISUALIZATION
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
+
 
 @hydra.main(config_path="../conf/train_bc", version_base="1.3")
 def main(cfg: DictConfig):
@@ -116,15 +121,31 @@ def main(cfg: DictConfig):
         if epoch % cfg.save_freq == 0:
             model.save(f"{work_dir}/model_{epoch}.ckpt")
 
+            # def vis_and_log(model, vis_dataloader, mode="train"):
+            #     eval_dict = visualize(model, vis_dataloader, mix_precision=cfg.mix_precision)
+
+            #     caption = f"reconstruction (right) @ epoch {epoch}; \n Track MSE: {eval_dict['track_loss']:.4f}; Img MSE: {eval_dict['img_loss']:.4f}"
+            #     wandb_image = wandb.Image(eval_dict["combined_image"], caption=caption)
+            #     wandb_vid_rollout = wandb.Video(eval_dict["combined_track_vid"], fps=24, format="mp4", caption=caption)
+            #     None if cfg.dry else wandb.log({f"{mode}/first_frame": wandb_image,
+            #                                     f"{mode}/rollout_track": wandb_vid_rollout},
+            #                                     step=epoch)
+
             def vis_and_log(model, vis_dataloader, mode="train"):
                 eval_dict = visualize(model, vis_dataloader, mix_precision=cfg.mix_precision)
-
+            
                 caption = f"reconstruction (right) @ epoch {epoch}; \n Track MSE: {eval_dict['track_loss']:.4f}; Img MSE: {eval_dict['img_loss']:.4f}"
                 wandb_image = wandb.Image(eval_dict["combined_image"], caption=caption)
                 wandb_vid_rollout = wandb.Video(eval_dict["combined_track_vid"], fps=24, format="mp4", caption=caption)
-                None if cfg.dry else wandb.log({f"{mode}/first_frame": wandb_image,
-                                                f"{mode}/rollout_track": wandb_vid_rollout},
-                                                step=epoch)
+                log_dict = {
+                    f"{mode}/first_frame": wandb_image,
+                    f"{mode}/rollout_track": wandb_vid_rollout,
+                }
+                
+                if 'policy_input_vis' in eval_dict:
+                    log_dict[f"{mode}/policy_input"] = eval_dict['policy_input_vis']
+                
+                None if cfg.dry else wandb.log(log_dict, step=epoch)
 
             if fabric.is_global_zero and hasattr(model, "forward_vis"):
                 vis_and_log(model, train_vis_dataloader, mode="train")
@@ -227,6 +248,24 @@ def evaluate(model, dataloader, mix_precision=False, tag="val"):
     return out_dict
 
 
+# @torch.no_grad()
+# def visualize(model, dataloader, mix_precision=False):
+#     model.eval()
+#     keep_eval_dict = None
+
+#     for obs, track_obs, track, task_emb, action, extra_states in dataloader:
+#         obs, track_obs, track, task_emb = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda()
+#         extra_states = {k: v.cuda() for k, v in extra_states.items()}
+#         if mix_precision:
+#             obs, track_obs, track, task_emb = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16()
+#             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
+#         _, eval_dict = model.forward_vis(obs, track_obs, track, task_emb, extra_states, action)
+#         keep_eval_dict = eval_dict
+#         break
+
+#     return keep_eval_dict
+
+# visualize for intermediate outputs
 @torch.no_grad()
 def visualize(model, dataloader, mix_precision=False):
     model.eval()
@@ -236,14 +275,56 @@ def visualize(model, dataloader, mix_precision=False):
         obs, track_obs, track, task_emb = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:
-            obs, track_obs, track, task_emb = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16()
+            obs = obs.bfloat16()
+            track_obs = track_obs.bfloat16()
+            track = track.bfloat16()
+            task_emb = task_emb.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
-        _, eval_dict = model.forward_vis(obs, track_obs, track, task_emb, extra_states, action)
+
+        # Call forward_vis and unpack the returned values
+        _, eval_dict, policy_input = model.forward_vis(obs, track_obs, track, task_emb, extra_states, action)
+        
+        # Create visualization of policy_input
+        if policy_input is not None:
+            policy_input_vis = visualize_policy_input(policy_input)
+            eval_dict['policy_input_vis'] = policy_input_vis
+
         keep_eval_dict = eval_dict
         break
 
     return keep_eval_dict
 
+# Visualizing policy input
+def visualize_policy_input(policy_input):
+    # Convert to numpy and take the first item in the batch
+    data = policy_input[0].cpu().float().numpy()
+    
+    # Create figure and axis objects
+    fig, ax = plt.subplots(figsize=(10, 5))
+    
+    # Create heatmap
+    im = ax.imshow(data, aspect='auto', cmap='viridis')
+    
+    # Add colorbar
+    plt.colorbar(im)
+    
+    # Set title and labels
+    ax.set_title("Policy Network Input")
+    ax.set_xlabel("Feature Dimension")
+    ax.set_ylabel("Time Step")
+    
+    # Save plot to a buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    
+    # Convert buffer to PIL Image
+    image = Image.open(buf)
+    
+    # Close the plot to free up memory
+    plt.close(fig)
+    
+    return wandb.Image(image)
 
 def setup(cfg):
     import warnings

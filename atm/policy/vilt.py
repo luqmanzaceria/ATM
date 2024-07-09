@@ -199,10 +199,26 @@ class BCViLTPolicy(nn.Module):
         nn.init.normal_(action_cls_token, std=1e-6)
         self.register_parameter("action_cls_token", action_cls_token)
 
-    def _setup_policy_head(self, network_name, **policy_head_kwargs):
-        policy_head_kwargs["input_size"] \
-            = self.temporal_embed_size + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
+    # def _setup_policy_head(self, network_name, **policy_head_kwargs):
+    #     policy_head_kwargs["input_size"] \
+    #         = self.temporal_embed_size + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
 
+    #     action_shape = policy_head_kwargs["output_size"]
+    #     self.act_shape = action_shape
+    #     self.out_shape = np.prod(action_shape)
+    #     policy_head_kwargs["output_size"] = self.out_shape
+    #     self.policy_head = eval(network_name)(**policy_head_kwargs)
+
+    # _setup_policy_head with intermediate outputs
+    def _setup_policy_head(self, network_name, **policy_head_kwargs):
+        # Calculate the new input size including intermediate representations
+        intermediate_size = self.track.transformer.layers[0][0].attn.in_proj_weight.shape[1] * len(self.track.transformer.layers) * 2  # Assuming 2 sublayers per transformer layer
+        policy_head_kwargs["input_size"] = (
+            self.temporal_embed_size 
+            + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
+            + intermediate_size
+        )
+    
         action_shape = policy_head_kwargs["output_size"]
         self.act_shape = action_shape
         self.out_shape = np.prod(action_shape)
@@ -237,53 +253,160 @@ class BCViLTPolicy(nn.Module):
         tr_view = rearrange(tr_view, "(b t tl n) v c -> b v t tl n c", b=b, v=v, t=t, tl=tl, n=n, c=d + v)
         return tr_view
 
+    # def track_encode(self, track_obs, task_emb):
+    #     """
+    #     Args:
+    #         track_obs: b v t tt_fs c h w
+    #         task_emb: b e
+    #     Returns: b v t track_len n 2
+    #     """
+    #     assert self.num_track_ids == 32
+    #     b, v, t, *_ = track_obs.shape
+
+    #     if self.use_zero_track:
+    #         recon_tr = torch.zeros((b, v, t, self.num_track_ts, self.num_track_ids, 2), device=track_obs.device, dtype=track_obs.dtype)
+    #     else:
+    #         track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
+
+    #         grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+    #         grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+    #         grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
+
+    #         expand_task_emb = repeat(task_emb, "b e -> b v t e", b=b, v=v, t=t)
+    #         expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
+    #         with torch.no_grad():
+    #             pred_tr, _ = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
+    #             recon_tr = rearrange(pred_tr, "(b v t) tl n d -> b v t tl n d", b=b, v=v, t=t)
+
+    #     recon_tr = recon_tr[:, :, :, :self.policy_num_track_ts, :, :]  # truncate the track to a shorter one
+    #     _recon_tr = recon_tr.clone()  # b v t tl n 2
+    #     with torch.no_grad():
+    #         tr_view = self._get_view_one_hot(recon_tr)  # b v t tl n c
+
+    #     tr_view = rearrange(tr_view, "b v t tl n c -> (b v t) tl n c")
+    #     tr = self.track_proj_encoder(tr_view)  # (b v t) track_patch_num n d
+    #     tr = rearrange(tr, "(b v t) pn n d -> (b t n) (v pn) d", b=b, v=v, t=t, n=self.num_track_ids)  # (b t n) (v patch_num) d
+
+    #     return tr, _recon_tr
+
+    # track_encode with intermediate outputs
     def track_encode(self, track_obs, task_emb):
-        """
-        Args:
-            track_obs: b v t tt_fs c h w
-            task_emb: b e
-        Returns: b v t track_len n 2
-        """
         assert self.num_track_ids == 32
         b, v, t, *_ = track_obs.shape
-
+    
         if self.use_zero_track:
             recon_tr = torch.zeros((b, v, t, self.num_track_ts, self.num_track_ids, 2), device=track_obs.device, dtype=track_obs.dtype)
+            intermediate_outputs = []
         else:
             track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
-
             grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
             grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
             grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
-
             expand_task_emb = repeat(task_emb, "b e -> b v t e", b=b, v=v, t=t)
             expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
             with torch.no_grad():
-                pred_tr, _ = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
+                pred_tr, _, intermediate_outputs = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
                 recon_tr = rearrange(pred_tr, "(b v t) tl n d -> b v t tl n d", b=b, v=v, t=t)
-
+    
         recon_tr = recon_tr[:, :, :, :self.policy_num_track_ts, :, :]  # truncate the track to a shorter one
         _recon_tr = recon_tr.clone()  # b v t tl n 2
         with torch.no_grad():
             tr_view = self._get_view_one_hot(recon_tr)  # b v t tl n c
-
         tr_view = rearrange(tr_view, "b v t tl n c -> (b v t) tl n c")
         tr = self.track_proj_encoder(tr_view)  # (b v t) track_patch_num n d
         tr = rearrange(tr, "(b v t) pn n d -> (b t n) (v pn) d", b=b, v=v, t=t, n=self.num_track_ids)  # (b t n) (v patch_num) d
+    
+        # Process intermediate outputs
+        if intermediate_outputs:
+            additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
+            tr = torch.cat([tr, additional_features], dim=-1)
+    
+        return tr, _recon_tr, intermediate_outputs
 
-        return tr, _recon_tr
+    # def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False):
+    #     """
+    #     Encode the images separately in the videos along the spatial axis.
+    #     Args:
+    #         obs: b v t c h w
+    #         track_obs: b v t tt_fs c h w, (0, 255)
+    #         task_emb: b e
+    #         extra_states: {k: b t n}
+    #     Returns: out: (b t 2+num_extra c), recon_track: (b v t tl n 2)
+    #     """
+    #     # 1. encode image
+    #     img_encoded = []
+    #     for view_idx in range(self.num_views):
+    #         img_encoded.append(
+    #             rearrange(
+    #                 TensorUtils.time_distributed(
+    #                     obs[:, view_idx, ...], self.image_encoders[view_idx]
+    #                 ),
+    #                 "b t c h w -> b t (h w) c",
+    #             )
+    #         )  # (b, t, num_patches, c)
 
+    #     img_encoded = torch.cat(img_encoded, -2)  # (b, t, 2*num_patches, c)
+    #     img_encoded += self.img_patch_pos_embed.unsqueeze(0)  # (b, t, 2*num_patches, c)
+    #     B, T = img_encoded.shape[:2]
+
+    #     # 2. encode task_emb
+    #     text_encoded = self.language_encoder_spatial(task_emb)  # (b, c)
+    #     text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
+
+    #     # 3. encode track
+    #     track_encoded, _recon_track = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
+    #     # patch position embedding
+    #     tr_feat, tr_id_emb = track_encoded[:, :, :-self.track_id_embed_dim], track_encoded[:, :, -self.track_id_embed_dim:]
+    #     tr_feat += self.track_patch_pos_embed  # ((b t n), 2*patch_num, c)
+    #     # track id embedding
+    #     tr_id_emb[:, 1:, -self.track_id_embed_dim:] = tr_id_emb[:, :1, -self.track_id_embed_dim:]  # guarantee the permutation invariance
+    #     track_encoded = torch.cat([tr_feat, tr_id_emb], dim=-1)
+    #     track_encoded = rearrange(track_encoded, "(b t n) pn d -> b t (n pn) d", b=B, t=T)  # (b, t, 2*num_track*num_track_patch, c)
+
+    #     # 3. concat img + track + text embs then add modality embeddings
+    #     if self.spatial_transformer_use_text:
+    #         img_track_text_encoded = torch.cat([img_encoded, track_encoded, text_encoded], -2)  # (b, t, 2*num_img_patch + 2*num_track*num_track_patch + 1, c)
+    #         img_track_text_encoded += self.modality_embed[None, :, self.modality_idx, :]
+    #     else:
+    #         img_track_text_encoded = torch.cat([img_encoded, track_encoded], -2)  # (b, t, 2*num_img_patch + 2*num_track*num_track_patch, c)
+    #         img_track_text_encoded += self.modality_embed[None, :, self.modality_idx[:-1], :]
+
+    #     # 4. add spatial token
+    #     spatial_token = self.spatial_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c)
+    #     encoded = torch.cat([spatial_token, img_track_text_encoded], -2)  # (b, t, 2*num_img_patch + 2*num_track*num_track_patch + 2, c)
+
+    #     # 5. pass through transformer
+    #     encoded = rearrange(encoded, "b t n c -> (b t) n c")  # (b*t, 2*num_img_patch + 2*num_track*num_track_patch + 2, c)
+    #     out = self.spatial_transformer(encoded)
+    #     out = out[:, 0]  # extract spatial token as summary at o_t
+    #     out = self.spatial_downsample(out).view(B, T, 1, -1)  # (b, t, 1, c')
+
+    #     # 6. encode extra states
+    #     if self.extra_encoder is None:
+    #         extra = None
+    #     else:
+    #         extra = self.extra_encoder(extra_states)  # (B, T, num_extra, c')
+
+    #     # 7. encode language, treat it as action token
+    #     text_encoded_ = self.language_encoder_temporal(task_emb)  # (b, c')
+    #     text_encoded_ = text_encoded_.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c')
+    #     action_cls_token = self.action_cls_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c')
+    #     if self.temporal_transformer_use_text:
+    #         out_seq = [action_cls_token, text_encoded_, out]
+    #     else:
+    #         out_seq = [action_cls_token, out]
+
+    #     if self.extra_encoder is not None:
+    #         out_seq.append(extra)
+    #     output = torch.cat(out_seq, -2)  # (b, t, 2 or 3 + num_extra, c')
+
+    #     if return_recon:
+    #         output = (output, _recon_track)
+
+    #     return output
+
+    # spatial_encode with intermediate_outputs
     def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False):
-        """
-        Encode the images separately in the videos along the spatial axis.
-        Args:
-            obs: b v t c h w
-            track_obs: b v t tt_fs c h w, (0, 255)
-            task_emb: b e
-            extra_states: {k: b t n}
-        Returns: out: (b t 2+num_extra c), recon_track: (b v t tl n 2)
-        """
-        # 1. encode image
         img_encoded = []
         for view_idx in range(self.num_views):
             img_encoded.append(
@@ -294,50 +417,48 @@ class BCViLTPolicy(nn.Module):
                     "b t c h w -> b t (h w) c",
                 )
             )  # (b, t, num_patches, c)
-
+    
         img_encoded = torch.cat(img_encoded, -2)  # (b, t, 2*num_patches, c)
         img_encoded += self.img_patch_pos_embed.unsqueeze(0)  # (b, t, 2*num_patches, c)
         B, T = img_encoded.shape[:2]
-
-        # 2. encode task_emb
+    
         text_encoded = self.language_encoder_spatial(task_emb)  # (b, c)
         text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
-
-        # 3. encode track
-        track_encoded, _recon_track = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
-        # patch position embedding
+    
+        track_encoded, _recon_track, intermediate_outputs = self.track_encode(track_obs, task_emb)
+        
+        # Process intermediate outputs
+        if intermediate_outputs:
+            additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
+            additional_features = additional_features.view(B, T, -1)  # Reshape to match other tensors
+            track_encoded = torch.cat([track_encoded, additional_features], dim=-1)
+        
         tr_feat, tr_id_emb = track_encoded[:, :, :-self.track_id_embed_dim], track_encoded[:, :, -self.track_id_embed_dim:]
         tr_feat += self.track_patch_pos_embed  # ((b t n), 2*patch_num, c)
-        # track id embedding
         tr_id_emb[:, 1:, -self.track_id_embed_dim:] = tr_id_emb[:, :1, -self.track_id_embed_dim:]  # guarantee the permutation invariance
         track_encoded = torch.cat([tr_feat, tr_id_emb], dim=-1)
         track_encoded = rearrange(track_encoded, "(b t n) pn d -> b t (n pn) d", b=B, t=T)  # (b, t, 2*num_track*num_track_patch, c)
-
-        # 3. concat img + track + text embs then add modality embeddings
+    
         if self.spatial_transformer_use_text:
             img_track_text_encoded = torch.cat([img_encoded, track_encoded, text_encoded], -2)  # (b, t, 2*num_img_patch + 2*num_track*num_track_patch + 1, c)
             img_track_text_encoded += self.modality_embed[None, :, self.modality_idx, :]
         else:
             img_track_text_encoded = torch.cat([img_encoded, track_encoded], -2)  # (b, t, 2*num_img_patch + 2*num_track*num_track_patch, c)
             img_track_text_encoded += self.modality_embed[None, :, self.modality_idx[:-1], :]
-
-        # 4. add spatial token
+    
         spatial_token = self.spatial_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c)
         encoded = torch.cat([spatial_token, img_track_text_encoded], -2)  # (b, t, 2*num_img_patch + 2*num_track*num_track_patch + 2, c)
-
-        # 5. pass through transformer
+    
         encoded = rearrange(encoded, "b t n c -> (b t) n c")  # (b*t, 2*num_img_patch + 2*num_track*num_track_patch + 2, c)
         out = self.spatial_transformer(encoded)
         out = out[:, 0]  # extract spatial token as summary at o_t
         out = self.spatial_downsample(out).view(B, T, 1, -1)  # (b, t, 1, c')
-
-        # 6. encode extra states
+    
         if self.extra_encoder is None:
             extra = None
         else:
             extra = self.extra_encoder(extra_states)  # (B, T, num_extra, c')
-
-        # 7. encode language, treat it as action token
+    
         text_encoded_ = self.language_encoder_temporal(task_emb)  # (b, c')
         text_encoded_ = text_encoded_.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c')
         action_cls_token = self.action_cls_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c')
@@ -345,16 +466,16 @@ class BCViLTPolicy(nn.Module):
             out_seq = [action_cls_token, text_encoded_, out]
         else:
             out_seq = [action_cls_token, out]
-
+    
         if self.extra_encoder is not None:
             out_seq.append(extra)
         output = torch.cat(out_seq, -2)  # (b, t, 2 or 3 + num_extra, c')
-
+    
         if return_recon:
-            output = (output, _recon_track)
-
+            output = (output, _recon_track, intermediate_outputs)
+    
         return output
-
+    
     def temporal_encode(self, x):
         """
         Args:
@@ -371,23 +492,40 @@ class BCViLTPolicy(nn.Module):
         x = x.reshape(*sh)  # (b, t, num_modality, c)
         return x[:, :, 0]  # (b, t, c)
 
+    # def forward(self, obs, track_obs, track, task_emb, extra_states):
+    #     """
+    #     Return feature and info.
+    #     Args:
+    #         obs: b v t c h w
+    #         track_obs: b v t tt_fs c h w
+    #         track: b v t track_len n 2, not used for training, only preserved for unified interface
+    #         extra_states: {k: b t e}
+    #     """
+    #     x, recon_track = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)  # x: (b, t, 2+num_extra, c), recon_track: (b, v, t, tl, n, 2)
+    #     x = self.temporal_encode(x)  # (b, t, c)
+
+    #     recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
+    #     x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
+
+    #     dist = self.policy_head(x)  # only use the current timestep feature to predict action
+    #     return dist
+
+    # forward with intermediate_outputs
     def forward(self, obs, track_obs, track, task_emb, extra_states):
-        """
-        Return feature and info.
-        Args:
-            obs: b v t c h w
-            track_obs: b v t tt_fs c h w
-            track: b v t track_len n 2, not used for training, only preserved for unified interface
-            extra_states: {k: b t e}
-        """
-        x, recon_track = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)  # x: (b, t, 2+num_extra, c), recon_track: (b, v, t, tl, n, 2)
+        x, recon_track, intermediate_outputs = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)
         x = self.temporal_encode(x)  # (b, t, c)
-
+    
         recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
-        x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
-
-        dist = self.policy_head(x)  # only use the current timestep feature to predict action
-        return dist
+        
+        if intermediate_outputs:
+            additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
+            additional_features = additional_features.view(x.shape[0], x.shape[1], -1)  # Reshape to match other tensors
+            policy_input = torch.cat([x, recon_track, additional_features], dim=-1)
+        else:
+            policy_input = torch.cat([x, recon_track], dim=-1)
+    
+        dist = self.policy_head(policy_input)  # only use the current timestep feature to predict action
+        return dist, policy_input  # Return policy_input for visualization
 
     def forward_loss(self, obs, track_obs, track, task_emb, extra_states, action):
         """
@@ -460,54 +598,103 @@ class BCViLTPolicy(nn.Module):
                 all_ret_dict[k] = np.mean(v)
         return None, all_ret_dict
 
+    # def act(self, obs, task_emb, extra_states):
+    #     """
+    #     Args:
+    #         obs: (b, v, h, w, c)
+    #         task_emb: (b, em_dim)
+    #         extra_states: {k: (b, state_dim,)}
+    #     """
+    #     self.eval()
+    #     B = obs.shape[0]
+
+    #     # expand time dimenstion
+    #     obs = rearrange(obs, "b v h w c -> b v 1 c h w").copy()
+    #     extra_states = {k: rearrange(v, "b e -> b 1 e") for k, v in extra_states.items()}
+
+    #     dtype = next(self.parameters()).dtype
+    #     device = next(self.parameters()).device
+    #     obs = torch.Tensor(obs).to(device=device, dtype=dtype)
+    #     task_emb = torch.Tensor(task_emb).to(device=device, dtype=dtype)
+    #     extra_states = {k: torch.Tensor(v).to(device=device, dtype=dtype) for k, v in extra_states.items()}
+
+    #     if (obs.shape[-2] != self.obs_shapes["rgb"][-2]) or (obs.shape[-1] != self.obs_shapes["rgb"][-1]):
+    #         obs = rearrange(obs, "b v fs c h w -> (b v fs) c h w")
+    #         obs = F.interpolate(obs, size=self.obs_shapes["rgb"][-2:], mode="bilinear", align_corners=False)
+    #         obs = rearrange(obs, "(b v fs) c h w -> b v fs c h w", b=B, v=self.num_views)
+
+    #     while len(self.track_obs_queue) < self.max_seq_len:
+    #         self.track_obs_queue.append(torch.zeros_like(obs))
+    #     self.track_obs_queue.append(obs.clone())
+    #     track_obs = torch.cat(list(self.track_obs_queue), dim=2)  # b v fs c h w
+    #     track_obs = rearrange(track_obs, "b v fs c h w -> b v 1 fs c h w")
+
+    #     obs = self._preprocess_rgb(obs)
+
+    #     with torch.no_grad():
+    #         x, rec_tracks = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True)  # x: (b, 1, 4, c), recon_track: (b, v, 1, tl, n, 2)
+    #         self.latent_queue.append(x)
+    #         x = torch.cat(list(self.latent_queue), dim=1)  # (b, t, 4, c)
+    #         x = self.temporal_encode(x)  # (b, t, c)
+
+    #         feat = torch.cat([x[:, -1], rearrange(rec_tracks[:, :, -1, :, :, :], "b v tl n d -> b (v tl n d)")], dim=-1)
+
+    #         action = self.policy_head.get_action(feat)  # only use the current timestep feature to predict action
+    #         action = action.detach().cpu()  # (b, act_dim)
+
+    #     action = action.reshape(-1, *self.act_shape)
+    #     action = torch.clamp(action, -1, 1)
+    #     return action.float().cpu().numpy(), (None, rec_tracks[:, :, -1, :, :, :])  # (b, *act_shape)
+
+    # act with intermediate outputs
     def act(self, obs, task_emb, extra_states):
-        """
-        Args:
-            obs: (b, v, h, w, c)
-            task_emb: (b, em_dim)
-            extra_states: {k: (b, state_dim,)}
-        """
         self.eval()
         B = obs.shape[0]
-
-        # expand time dimenstion
+    
         obs = rearrange(obs, "b v h w c -> b v 1 c h w").copy()
         extra_states = {k: rearrange(v, "b e -> b 1 e") for k, v in extra_states.items()}
-
+    
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
         obs = torch.Tensor(obs).to(device=device, dtype=dtype)
         task_emb = torch.Tensor(task_emb).to(device=device, dtype=dtype)
         extra_states = {k: torch.Tensor(v).to(device=device, dtype=dtype) for k, v in extra_states.items()}
-
+    
         if (obs.shape[-2] != self.obs_shapes["rgb"][-2]) or (obs.shape[-1] != self.obs_shapes["rgb"][-1]):
             obs = rearrange(obs, "b v fs c h w -> (b v fs) c h w")
             obs = F.interpolate(obs, size=self.obs_shapes["rgb"][-2:], mode="bilinear", align_corners=False)
             obs = rearrange(obs, "(b v fs) c h w -> b v fs c h w", b=B, v=self.num_views)
-
+    
         while len(self.track_obs_queue) < self.max_seq_len:
             self.track_obs_queue.append(torch.zeros_like(obs))
         self.track_obs_queue.append(obs.clone())
         track_obs = torch.cat(list(self.track_obs_queue), dim=2)  # b v fs c h w
         track_obs = rearrange(track_obs, "b v fs c h w -> b v 1 fs c h w")
-
+    
         obs = self._preprocess_rgb(obs)
-
+    
         with torch.no_grad():
-            x, rec_tracks = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True)  # x: (b, 1, 4, c), recon_track: (b, v, 1, tl, n, 2)
+            x, rec_tracks, intermediate_outputs = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True)
             self.latent_queue.append(x)
             x = torch.cat(list(self.latent_queue), dim=1)  # (b, t, 4, c)
             x = self.temporal_encode(x)  # (b, t, c)
-
-            feat = torch.cat([x[:, -1], rearrange(rec_tracks[:, :, -1, :, :, :], "b v tl n d -> b (v tl n d)")], dim=-1)
-
+    
+            rec_tracks_reshaped = rearrange(rec_tracks[:, :, -1, :, :, :], "b v tl n d -> b (v tl n d)")
+            
+            if intermediate_outputs:
+                additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
+                additional_features = additional_features.view(x.shape[0], -1)  # Reshape to match other tensors
+                feat = torch.cat([x[:, -1], rec_tracks_reshaped, additional_features], dim=-1)
+            else:
+                feat = torch.cat([x[:, -1], rec_tracks_reshaped], dim=-1)
+    
             action = self.policy_head.get_action(feat)  # only use the current timestep feature to predict action
             action = action.detach().cpu()  # (b, act_dim)
-
+    
         action = action.reshape(-1, *self.act_shape)
         action = torch.clamp(action, -1, 1)
         return action.float().cpu().numpy(), (None, rec_tracks[:, :, -1, :, :, :])  # (b, *act_shape)
-
+    
     def reset(self):
         self.latent_queue.clear()
         self.track_obs_queue.clear()
