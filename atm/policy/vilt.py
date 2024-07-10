@@ -107,13 +107,16 @@ class BCViLTPolicy(nn.Module):
 
         track_cfg.model_cfg.load_path = f"{track_fn}/model_best.ckpt"
         track_cls = eval(track_cfg.model_name)
+        self.num_track_ids = 18 ############
         self.track = track_cls(**track_cfg.model_cfg)
+        self.track.num_track_ids = 18 #############
         # freeze
         self.track.eval()
         for param in self.track.parameters():
             param.requires_grad = False
 
-        self.num_track_ids = self.track.num_track_ids
+        # self.num_track_ids = self.track.num_track_ids
+        self.num_track_ids = 18
         self.num_track_ts = self.track.num_track_ts
         self.policy_track_patch_size = self.track.track_patch_size if policy_track_patch_size is None else policy_track_patch_size
 
@@ -203,6 +206,8 @@ class BCViLTPolicy(nn.Module):
         policy_head_kwargs["input_size"] \
             = self.temporal_embed_size + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
 
+        print(f"Policy head input size: {policy_head_kwargs['input_size']}")
+
         action_shape = policy_head_kwargs["output_size"]
         self.act_shape = action_shape
         self.out_shape = np.prod(action_shape)
@@ -244,7 +249,13 @@ class BCViLTPolicy(nn.Module):
             task_emb: b e
         Returns: b v t track_len n 2
         """
-        assert self.num_track_ids == 32
+        print(f"track_encode - track_obs shape: {track_obs.shape}")
+        print(f"track_encode - self.num_track_ts: {self.num_track_ts}")
+        print(f"track_encode - self.num_track_ids: {self.num_track_ids}")
+        print(f"track_encode - self.policy_track_patch_size: {self.policy_track_patch_size}")
+        # assert self.num_track_ids == 32
+        print("HERE LOOK HERE AGAIN self.num_track_ids", self.num_track_ids)
+        assert self.num_track_ids == 18
         b, v, t, *_ = track_obs.shape
 
         if self.use_zero_track:
@@ -252,7 +263,9 @@ class BCViLTPolicy(nn.Module):
         else:
             track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
 
-            grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+            # grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+            # grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+            grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
             grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
             grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
 
@@ -260,6 +273,7 @@ class BCViLTPolicy(nn.Module):
             expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
             with torch.no_grad():
                 pred_tr, _ = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
+                print(f"track_encode - pred_tr shape: {pred_tr.shape}") 
                 recon_tr = rearrange(pred_tr, "(b v t) tl n d -> b v t tl n d", b=b, v=v, t=t)
 
         recon_tr = recon_tr[:, :, :, :self.policy_num_track_ts, :, :]  # truncate the track to a shorter one
@@ -385,7 +399,7 @@ class BCViLTPolicy(nn.Module):
 
         recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
         x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
-
+        print(f"Shape of x before policy_head: {x.shape}")
         dist = self.policy_head(x)  # only use the current timestep feature to predict action
         return dist
 
@@ -439,7 +453,7 @@ class BCViLTPolicy(nn.Module):
             pad_track = repeat(last_track, "b v 1 n d -> b v tl n d", tl=self.num_track_ts-t)
             track = torch.cat([track, pad_track], dim=2)
 
-        grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+        grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
         grid_track = repeat(grid_points, "n d -> b v tl n d", b=b, v=v, tl=self.num_track_ts)
 
         all_ret_dict = {}

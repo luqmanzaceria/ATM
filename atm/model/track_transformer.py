@@ -55,7 +55,9 @@ class TrackTransformer(nn.Module):
 
     def _init_track_modules(self, dim, num_track_ts, num_track_ids, patch_size=1):
         self.num_track_ts = num_track_ts
-        self.num_track_ids = num_track_ids
+        # self.num_track_ids = num_track_ids
+        self.num_track_ids = 18
+        print("HERE LOOK HERE self.num_track_ids", self.num_track_ids)
         self.track_patch_size = patch_size
 
         self.track_proj_encoder = TrackPatchEmbed(
@@ -68,6 +70,11 @@ class TrackTransformer(nn.Module):
         self.track_decoder = nn.Linear(dim, 2 * patch_size, bias=True)
         self.num_track_ids = num_track_ids
         self.num_track_ts = num_track_ts
+
+        print(f"TrackTransformer init - num_track_ts: {self.num_track_ts}")
+        print(f"TrackTransformer init - num_track_ids: {self.num_track_ids}")
+        print(f"TrackTransformer init - track_patch_size: {self.track_patch_size}")
+        print(f"TrackTransformer init - num_track_patches: {self.num_track_patches}")
 
         return self.track_proj_encoder, self.track_decoder
 
@@ -180,6 +187,7 @@ class TrackTransformer(nn.Module):
         B, T, _, _ = track.shape
         patches = self._encode_video(vid, p_img)  # (b, n_image, d)
         enc_track = self._encode_track(track)
+        print(f"TrackTransformer forward - enc_track shape: {enc_track.shape}")
 
         text_encoded = self.language_encoder(task_emb)  # (b, c)
         text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
@@ -187,12 +195,40 @@ class TrackTransformer(nn.Module):
         x = torch.cat([enc_track, patches, text_encoded], dim=1)
         x = self.transformer(x)
 
-        rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
-        rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
-        rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
-        num_track_h = self.num_track_ts // self.track_patch_size
-        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
+        print(f"TrackTransformer forward - transformer output shape: {x.shape}")
 
+        # rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+        # rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+        # rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+
+        # rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+        # print(f"TrackTransformer forward - rec_track shape: {rec_track.shape}")
+        # print(f"TrackTransformer forward - self.num_track_patches: {self.num_track_patches}")
+        # print(f"TrackTransformer forward - self.track_patch_size: {self.track_patch_size}")
+        # rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+        # rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+        # print(f"TrackTransformer forward - rec_track shape after decoder: {rec_track.shape}")
+        
+        # num_track_h = self.num_track_ts // self.track_patch_size
+        # print(f"TrackTransformer forward - num_track_h: {num_track_h}")
+        # # rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
+        # rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h, n=self.num_track_ids)
+
+        # return rec_track, rec_patches
+
+        rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+        print(f"TrackTransformer forward - rec_track shape: {rec_track.shape}")
+        print(f"TrackTransformer forward - self.num_track_patches: {self.num_track_patches}")
+        print(f"TrackTransformer forward - self.track_patch_size: {self.track_patch_size}")
+        rec_patches = self.img_decoder(rec_patches)
+        rec_track = self.track_decoder(rec_track)
+        print(f"TrackTransformer forward - rec_track shape after decoder: {rec_track.shape}")
+        
+        num_track_h = self.num_track_ts // self.track_patch_size
+        print(f"TrackTransformer forward - num_track_h: {num_track_h}")
+        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h, n=self.num_track_ids)
+        print(f"TrackTransformer forward - rec_track shape after rearrange: {rec_track.shape}")
+    
         return rec_track, rec_patches
 
     def reconstruct(self, vid, track, task_emb, p_img):
