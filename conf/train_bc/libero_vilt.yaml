@@ -19,7 +19,7 @@ train_gpus: [0]
 
 # Training
 lr: 5e-4
-batch_size: 128
+batch_size: 16
 mix_precision: false
 num_workers: 8
 val_freq: 5
