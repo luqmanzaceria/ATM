@@ -289,44 +289,45 @@ class TrackTransformer(nn.Module):
         """
         b = vid.shape[0]
         assert b == 1, "only support batch size 1 for visualization"
-
+    
         H, W = self.img_size
         _vid = vid.clone()
         track = self._preprocess_track(track)
         vid = self._preprocess_vid(vid)
-
-        rec_track, rec_patches = self.forward(vid, track, task_emb, p_img)
+    
+        rec_track, rec_patches, intermediate_outputs = self.forward(vid, track, task_emb, p_img)
         track_loss = F.mse_loss(rec_track, track)
         img_loss = F.mse_loss(rec_patches, self._patchify(vid))
         loss = track_loss + img_loss
-
+    
         rec_image = self._unpatchify(rec_patches)
-
+    
         # place them side by side
         combined_image = torch.cat([vid[:, -1], rec_image[:, -1]], dim=-1)  # only visualize the current frame
         combined_image = self.img_unnormalizer(combined_image) * 255
         combined_image = torch.clamp(combined_image, 0, 255)
         combined_image = rearrange(combined_image, '1 c h w -> h w c')
-
+    
         track = track.clone()
         rec_track = rec_track.clone()
-
+    
         rec_track_vid = tracks_to_video(rec_track, img_size=H)
         track_vid = tracks_to_video(track, img_size=H)
-
+    
         combined_track_vid = torch.cat([track_vid, rec_track_vid], dim=-1)
-
+    
         _vid = torch.cat([_vid, _vid], dim=-1)
         combined_track_vid = _vid * .25 + combined_track_vid * .75
-
+    
         ret_dict = {
             "loss": loss.sum().item(),
             "track_loss": track_loss.sum().item(),
             "img_loss": img_loss.sum().item(),
             "combined_image": combined_image.cpu().numpy().astype(np.uint8),
             "combined_track_vid": combined_track_vid.cpu().numpy().astype(np.uint8),
+            "intermediate_outputs": intermediate_outputs,  # Add this line to include intermediate outputs
         }
-
+    
         return loss.sum(), ret_dict
 
     def _patchify(self, imgs):

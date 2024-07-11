@@ -25,7 +25,7 @@ num_workers: 8
 val_freq: 5
 save_freq: 10
 clip_grad: 100.
-epochs: 101
+epochs: 1
 seed: 0
 dry: false
 
@@ -100,7 +100,8 @@ model_cfg:
     dropout: 0.1
     spatial_downsample: true
     spatial_downsample_embed_size: 64
-    use_language_token: false
+    # use_language_token: false
+    use_language_token: true
   temporal_transformer_cfg:
     num_layers: 4
     num_heads: 6
