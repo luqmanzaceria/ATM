@@ -234,8 +234,8 @@ class BCViLTPolicy(nn.Module):
 
     # _setup_policy_head with intermediate outputs
     def _setup_policy_head(self, network_name, **policy_head_kwargs):
-        # The total input size is 2114 based on the shape of policy_input
-        total_input_size = 2114
+        # The total input size is 2112 based on the shape of policy_input
+        total_input_size = 2112
         
         policy_head_kwargs["input_size"] = total_input_size
         
@@ -247,7 +247,7 @@ class BCViLTPolicy(nn.Module):
     
         print(f"Policy head input size: {total_input_size}")
         print(f"Policy head output size: {self.out_shape}")
-        
+            
     @torch.no_grad()
     def preprocess(self, obs, track, action):
         """
@@ -322,13 +322,19 @@ class BCViLTPolicy(nn.Module):
             intermediate_outputs = []
         else:
             track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
-            grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
-            grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
-            grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
             expand_task_emb = repeat(task_emb, "b e -> b v t e", b=b, v=v, t=t)
             expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
+    
+            # Create a dummy grid since we're not using it
+            dummy_grid = torch.zeros((b*v*t, self.num_track_ts, self.num_track_ids, 2), device=track_obs.device, dtype=track_obs.dtype)
+    
             with torch.no_grad():
-                pred_tr, _, intermediate_outputs = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)
+                pred_tr, _, intermediate_outputs = self.track.reconstruct(
+                    track_obs_to_pred, 
+                    dummy_grid,  # Pass the dummy grid
+                    expand_task_emb,
+                    p_img=0  # Set p_img to 0 or another appropriate value
+                )
                 recon_tr = rearrange(pred_tr, "(b v t) tl n d -> b v t tl n d", b=b, v=v, t=t)
     
         recon_tr = recon_tr[:, :, :, :self.policy_num_track_ts, :, :]
@@ -338,7 +344,7 @@ class BCViLTPolicy(nn.Module):
         tr_view = rearrange(tr_view, "b v t tl n c -> (b v t) tl n c")
         tr = self.track_proj_encoder(tr_view)
         tr = rearrange(tr, "(b v t) pn n d -> b t (v n pn) d", b=b, v=v, t=t, n=self.num_track_ids)
-
+    
         if intermediate_outputs:
             additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
         else:
@@ -599,17 +605,18 @@ class BCViLTPolicy(nn.Module):
     
         recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
         
-        if isinstance(intermediate_outputs, list) and len(intermediate_outputs) > 0:
-            additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
-            additional_features = additional_features.view(x.shape[0], x.shape[1], -1)  # Reshape to match other tensors
+        if isinstance(intermediate_outputs, torch.Tensor) and intermediate_outputs.numel() > 0:
+            additional_features = intermediate_outputs.view(x.shape[0], x.shape[1], -1)
             policy_input = torch.cat([x, recon_track, additional_features], dim=-1)
         else:
             policy_input = torch.cat([x, recon_track], dim=-1)
     
-        print(f"Shape of policy_input: {policy_input.shape}")
+        print(f"Shape of policy_input before reshaping: {policy_input.shape}")
     
         # Use only the last timestep for action prediction
         policy_input = policy_input[:, -1, :]  # (b, input_size)
+    
+        print(f"Shape of policy_input after reshaping: {policy_input.shape}")
     
         action = self.policy_head(policy_input)
         return action, policy_input
@@ -677,24 +684,46 @@ class BCViLTPolicy(nn.Module):
             track = torch.cat([track, pad_track], dim=2)
     
         all_ret_dict = {}
+        combined_images = []
+        combined_track_vids = []
         for view in range(self.num_views):
-            _, ret_dict = self.track.forward_vis(track_obs[:1, view, 0, :, ...], grid_track[:1, view], task_emb[:1], p_img=0)
+            # Create a dummy grid since we're not using it
+            dummy_grid = torch.zeros((1, self.num_track_ts, self.num_track_ids, 2), device=track_obs.device, dtype=track_obs.dtype)
+            
+            _, ret_dict = self.track.forward_vis(track_obs[:1, view, 0, :, ...], dummy_grid, task_emb[:1], p_img=0)
             
             for k, v in ret_dict.items():
                 if k in all_ret_dict:
                     all_ret_dict[k].extend(v if isinstance(v, list) else [v])
                 else:
                     all_ret_dict[k] = v if isinstance(v, list) else [v]
+            
+            if "combined_image" in ret_dict:
+                combined_images.append(ret_dict["combined_image"])
+            if "track_vid" in ret_dict:
+                combined_track_vids.append(ret_dict["track_vid"])
     
         # Process and calculate mean for numeric values
         for k, values in all_ret_dict.items():
-            if all(isinstance(x, torch.Tensor) for x in values):
-                values = [x.cpu().numpy() for x in values]  # Convert all tensors to numpy arrays
+            if k != "combined_image" and all(isinstance(x, (torch.Tensor, np.ndarray)) for x in values):
+                values = [x.cpu().numpy() if isinstance(x, torch.Tensor) else x for x in values]
                 all_ret_dict[k] = np.mean(values)
-            elif all(isinstance(x, (float, int, np.number)) for x in values):
+            elif k != "combined_image" and all(isinstance(x, (float, int, np.number)) for x in values):
                 all_ret_dict[k] = np.mean(values)
     
-        return None, all_ret_dict
+        # Combine images from all views
+        if combined_images:
+            all_ret_dict["combined_image"] = np.concatenate(combined_images, axis=1)
+        else:
+            all_ret_dict["combined_image"] = np.array([])
+    
+        # Combine track videos from all views
+        if combined_track_vids:
+            all_ret_dict["combined_track_vid"] = np.concatenate(combined_track_vids, axis=2)  # Assuming the videos are numpy arrays
+        else:
+            all_ret_dict["combined_track_vid"] = None
+    
+        return None, all_ret_dict, None
 
     # def act(self, obs, task_emb, extra_states):
     #     """
@@ -771,31 +800,13 @@ class BCViLTPolicy(nn.Module):
     
         obs = self._preprocess_rgb(obs)
     
-        # with torch.no_grad():
-        #     x, rec_tracks, intermediate_outputs = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True)
-        #     self.latent_queue.append(x)
-        #     x = torch.cat(list(self.latent_queue), dim=1)  # (b, t, 4, c)
-        #     x = self.temporal_encode(x)  # (b, t, c)
-    
-        #     rec_tracks_reshaped = rearrange(rec_tracks[:, :, -1, :, :, :], "b v tl n d -> b (v tl n d)")
-            
-        #     if intermediate_outputs:
-        #         additional_features = torch.cat([output.mean(dim=1) for output in intermediate_outputs], dim=-1)
-        #         additional_features = additional_features.view(x.shape[0], -1)  # Reshape to match other tensors
-        #         feat = torch.cat([x[:, -1], rec_tracks_reshaped, additional_features], dim=-1)
-        #     else:
-        #         feat = torch.cat([x[:, -1], rec_tracks_reshaped], dim=-1)
-    
-        #     action = self.policy_head.get_action(feat)  # only use the current timestep feature to predict action
-        #     action = action.detach().cpu()  # (b, act_dim)
-    
         with torch.no_grad():
             action, _ = self.forward(obs, track_obs, None, task_emb, extra_states)
             action = action.detach().cpu()  # (b, act_dim)
     
         action = action.reshape(-1, *self.act_shape)
         action = torch.clamp(action, -1, 1)
-        return action.float().cpu().numpy(), (None, rec_tracks[:, :, -1, :, :, :])  # (b, *act_shape)
+        return action.float().cpu().numpy(), (None, None)  # (b, *act_shape)
     
     def reset(self):
         self.latent_queue.clear()

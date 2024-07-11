@@ -134,18 +134,38 @@ def main(cfg: DictConfig):
             def vis_and_log(model, vis_dataloader, mode="train"):
                 eval_dict = visualize(model, vis_dataloader, mix_precision=cfg.mix_precision)
             
-                caption = f"reconstruction (right) @ epoch {epoch}; \n Track MSE: {eval_dict['track_loss']:.4f}; Img MSE: {eval_dict['img_loss']:.4f}"
-                wandb_image = wandb.Image(eval_dict["combined_image"], caption=caption)
-                wandb_vid_rollout = wandb.Video(eval_dict["combined_track_vid"], fps=24, format="mp4", caption=caption)
-                log_dict = {
-                    f"{mode}/first_frame": wandb_image,
-                    f"{mode}/rollout_track": wandb_vid_rollout,
-                }
-                
+                log_dict = {}
+            
+                if "combined_image" in eval_dict and eval_dict["combined_image"] is not None and eval_dict["combined_image"].size > 0:
+                    caption = f"reconstruction (right) @ epoch {epoch}; \n Track MSE: {eval_dict['track_loss']:.4f}; Img MSE: {eval_dict['img_loss']:.4f}"
+                    wandb_image = wandb.Image(eval_dict["combined_image"], caption=caption)
+                    log_dict[f"{mode}/first_frame"] = wandb_image
+                else:
+                    print(f"No combined image available for {mode} visualization")
+            
+                if "combined_track_vid" in eval_dict and eval_dict["combined_track_vid"] is not None:
+                    if isinstance(eval_dict["combined_track_vid"], (str, np.ndarray)):
+                        wandb_vid_rollout = wandb.Video(eval_dict["combined_track_vid"], fps=24, format="mp4", caption=caption)
+                        log_dict[f"{mode}/rollout_track"] = wandb_vid_rollout
+                    else:
+                        print(f"combined_track_vid is not in the correct format for wandb.Video")
+                else:
+                    print(f"No combined track video available for {mode} visualization")
+            
                 if 'policy_input_vis' in eval_dict:
                     log_dict[f"{mode}/policy_input"] = eval_dict['policy_input_vis']
-                
-                None if cfg.dry else wandb.log(log_dict, step=epoch)
+            
+                # Log other metrics
+                for k, v in eval_dict.items():
+                    if k not in ["combined_image", "combined_track_vid", "policy_input_vis"]:
+                        log_dict[f"{mode}/{k}"] = v
+            
+                if not cfg.dry:
+                    wandb.log(log_dict, step=epoch)
+                else:
+                    print("Dry run: logging skipped")
+            
+                return eval_dict
 
             if fabric.is_global_zero and hasattr(model, "forward_vis"):
                 vis_and_log(model, train_vis_dataloader, mode="train")
