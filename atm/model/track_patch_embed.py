@@ -11,7 +11,7 @@ class TrackPatchEmbed(nn.Module):
                  embed_dim):
         super().__init__()
         self.num_track_ts = num_track_ts
-        self.num_track_ids = 18
+        self.num_track_ids = 2
         self.patch_size = patch_size
         self.in_dim = in_dim
         self.embed_dim = embed_dim

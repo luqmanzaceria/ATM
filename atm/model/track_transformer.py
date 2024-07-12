@@ -56,7 +56,7 @@ class TrackTransformer(nn.Module):
     def _init_track_modules(self, dim, num_track_ts, num_track_ids, patch_size=1):
         self.num_track_ts = num_track_ts
         # self.num_track_ids = num_track_ids
-        self.num_track_ids = 18
+        self.num_track_ids = 2
         print("HERE LOOK HERE self.num_track_ids", self.num_track_ids)
         self.track_patch_size = patch_size
 
