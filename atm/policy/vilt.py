@@ -600,6 +600,9 @@ class BCViLTPolicy(nn.Module):
 
     # forward with intermediate_outputs
     def forward(self, obs, track_obs, track, task_emb, extra_states):
+        print(f"Input obs shape: {obs.shape}")
+        print(f"Input track_obs shape: {track_obs.shape}")
+        print(f"Input task_emb shape: {task_emb.shape}")
         x, recon_track, intermediate_outputs = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)
         x = self.temporal_encode(x)  # (b, t, c)
     
@@ -607,8 +610,10 @@ class BCViLTPolicy(nn.Module):
         
         if isinstance(intermediate_outputs, torch.Tensor) and intermediate_outputs.numel() > 0:
             additional_features = intermediate_outputs.view(x.shape[0], x.shape[1], -1)
+            print(f"Shape of additional features/intermediate outputs: {additional_features.shape}")
             policy_input = torch.cat([x, recon_track, additional_features], dim=-1)
         else:
+            print(f"Shape of intermediate outputs LOOK HERE: {intermediate_outputs[0].shape}")
             policy_input = torch.cat([x, recon_track], dim=-1)
     
         print(f"Shape of policy_input before reshaping: {policy_input.shape}")

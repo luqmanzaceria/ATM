@@ -221,11 +221,13 @@ class TrackTransformer(nn.Module):
         x = torch.cat([enc_track, patches, text_encoded], dim=1)
         
         intermediate_outputs = []
-        for layer in self.transformer.layers:
+        for i, layer in enumerate(self.transformer.layers):
             x = layer[0](x) + x  # attention layer
             intermediate_outputs.append(x.clone())
+            print(f"TrackTransformer intermediate output {i*2}: {x.shape}")
             x = layer[1](x) + x  # feedforward layer
             intermediate_outputs.append(x.clone())
+            print(f"TrackTransformer intermediate output {i*2+1}: {x.shape}")
         
         rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
         rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
