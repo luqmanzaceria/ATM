@@ -107,16 +107,16 @@ class BCViLTPolicy(nn.Module):
 
         track_cfg.model_cfg.load_path = f"{track_fn}/model_best.ckpt"
         track_cls = eval(track_cfg.model_name)
-        self.num_track_ids = 2 ############
+        self.num_track_ids = 8 ############
         self.track = track_cls(**track_cfg.model_cfg)
-        self.track.num_track_ids = 2 #############
+        self.track.num_track_ids = 8 #############
         # freeze
         self.track.eval()
         for param in self.track.parameters():
             param.requires_grad = False
 
         # self.num_track_ids = self.track.num_track_ids
-        self.num_track_ids = 2
+        self.num_track_ids = 8
         self.num_track_ts = self.track.num_track_ts
         self.policy_track_patch_size = self.track.track_patch_size if policy_track_patch_size is None else policy_track_patch_size
 
@@ -255,7 +255,7 @@ class BCViLTPolicy(nn.Module):
         print(f"track_encode - self.policy_track_patch_size: {self.policy_track_patch_size}")
         # assert self.num_track_ids == 32
         print("HERE LOOK HERE AGAIN self.num_track_ids", self.num_track_ids)
-        assert self.num_track_ids == 2
+        assert self.num_track_ids == 8
         b, v, t, *_ = track_obs.shape
 
         if self.use_zero_track:
@@ -265,7 +265,7 @@ class BCViLTPolicy(nn.Module):
 
             # grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
             # grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
-            grid_points = sample_double_grid(1, device=track_obs.device, dtype=track_obs.dtype)
+            grid_points = sample_double_grid(2, device=track_obs.device, dtype=track_obs.dtype)
             grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
             grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
 
@@ -453,7 +453,7 @@ class BCViLTPolicy(nn.Module):
             pad_track = repeat(last_track, "b v 1 n d -> b v tl n d", tl=self.num_track_ts-t)
             track = torch.cat([track, pad_track], dim=2)
 
-        grid_points = sample_double_grid(1, device=track_obs.device, dtype=track_obs.dtype)
+        grid_points = sample_double_grid(2, device=track_obs.device, dtype=track_obs.dtype)
         grid_track = repeat(grid_points, "n d -> b v tl n d", b=b, v=v, tl=self.num_track_ts)
 
         all_ret_dict = {}
