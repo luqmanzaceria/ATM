@@ -1,0 +1,474 @@
+diff --git a/1_3_grid_diff.txt b/1_3_grid_diff.txt
+deleted file mode 100644
+index 4d74251..0000000
+--- a/1_3_grid_diff.txt
++++ /dev/null
+@@ -1,356 +0,0 @@
+-diff --git a/atm/model/track_patch_embed.py b/atm/model/track_patch_embed.py
+-index a4bbe9b..5de29da 100644
+---- a/atm/model/track_patch_embed.py
+-+++ b/atm/model/track_patch_embed.py
+-@@ -11,7 +11,7 @@ class TrackPatchEmbed(nn.Module):
+-                  embed_dim):
+-         super().__init__()
+-         self.num_track_ts = num_track_ts
+--        self.num_track_ids = 2
+-+        self.num_track_ids = 18
+-         self.patch_size = patch_size
+-         self.in_dim = in_dim
+-         self.embed_dim = embed_dim
+-diff --git a/atm/model/track_transformer.py b/atm/model/track_transformer.py
+-index 0a33beb..08e3e0e 100644
+---- a/atm/model/track_transformer.py
+-+++ b/atm/model/track_transformer.py
+-@@ -56,7 +56,7 @@ class TrackTransformer(nn.Module):
+-     def _init_track_modules(self, dim, num_track_ts, num_track_ids, patch_size=1):
+-         self.num_track_ts = num_track_ts
+-         # self.num_track_ids = num_track_ids
+--        self.num_track_ids = 2
+-+        self.num_track_ids = 18
+-         print("HERE LOOK HERE self.num_track_ids", self.num_track_ids)
+-         self.track_patch_size = patch_size
+- 
+-diff --git a/atm/policy/vilt.py b/atm/policy/vilt.py
+-index 419217f..ccffdce 100644
+---- a/atm/policy/vilt.py
+-+++ b/atm/policy/vilt.py
+-@@ -107,16 +107,16 @@ class BCViLTPolicy(nn.Module):
+- 
+-         track_cfg.model_cfg.load_path = f"{track_fn}/model_best.ckpt"
+-         track_cls = eval(track_cfg.model_name)
+--        self.num_track_ids = 2 ############
+-+        self.num_track_ids = 18 ############
+-         self.track = track_cls(**track_cfg.model_cfg)
+--        self.track.num_track_ids = 2 #############
+-+        self.track.num_track_ids = 18 #############
+-         # freeze
+-         self.track.eval()
+-         for param in self.track.parameters():
+-             param.requires_grad = False
+- 
+-         # self.num_track_ids = self.track.num_track_ids
+--        self.num_track_ids = 2
+-+        self.num_track_ids = 18
+-         self.num_track_ts = self.track.num_track_ts
+-         self.policy_track_patch_size = self.track.track_patch_size if policy_track_patch_size is None else policy_track_patch_size
+- 
+-@@ -255,7 +255,7 @@ class BCViLTPolicy(nn.Module):
+-         print(f"track_encode - self.policy_track_patch_size: {self.policy_track_patch_size}")
+-         # assert self.num_track_ids == 32
+-         print("HERE LOOK HERE AGAIN self.num_track_ids", self.num_track_ids)
+--        assert self.num_track_ids == 2
+-+        assert self.num_track_ids == 18
+-         b, v, t, *_ = track_obs.shape
+- 
+-         if self.use_zero_track:
+-@@ -265,7 +265,7 @@ class BCViLTPolicy(nn.Module):
+- 
+-             # grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+-             # grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+--            grid_points = sample_double_grid(1, device=track_obs.device, dtype=track_obs.dtype)
+-+            grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+-             grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+-             grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
+- 
+-@@ -453,7 +453,7 @@ class BCViLTPolicy(nn.Module):
+-             pad_track = repeat(last_track, "b v 1 n d -> b v tl n d", tl=self.num_track_ts-t)
+-             track = torch.cat([track, pad_track], dim=2)
+- 
+--        grid_points = sample_double_grid(1, device=track_obs.device, dtype=track_obs.dtype)
+-+        grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+-         grid_track = repeat(grid_points, "n d -> b v tl n d", b=b, v=v, tl=self.num_track_ts)
+- 
+-         all_ret_dict = {}
+-diff --git a/atm/utils/flow_utils.py b/atm/utils/flow_utils.py
+-index ead70da..80dc93a 100644
+---- a/atm/utils/flow_utils.py
+-+++ b/atm/utils/flow_utils.py
+-@@ -68,7 +68,7 @@ def sample_tracks_nearest_to_grids(tracks, vis, num_samples):
+-     """
+-     # assert num_samples == 32
+-     # reference_grid_points = sample_double_grid(n=4, device="cpu")  # (32, 2)
+--    assert num_samples == 2
+-+    assert num_samples == 18
+-     reference_grid_points = sample_double_grid(n=3, device="cpu")  # (32, 2)
+- 
+-     first_points = tracks[0]  # (n, 2)
+-diff --git a/conf/train_bc/libero_vilt.yaml b/conf/train_bc/libero_vilt.yaml
+-index 985f141..2a823b1 100644
+---- a/conf/train_bc/libero_vilt.yaml
+-+++ b/conf/train_bc/libero_vilt.yaml
+-@@ -33,7 +33,7 @@ img_size: 128
+- frame_stack: 10
+- num_track_ts: 16
+- # num_track_ids: 32
+--num_track_ids: 2
+-+num_track_ids: 18
+- extra_state_keys: ["joint_states", "gripper_states"]
+- 
+- aug_prob: 0.9
+-@@ -71,7 +71,7 @@ model_cfg:
+-     obs_shapes:
+-       rgb: [3, 128, 128]
+-       # tracks: [16, 32, 2]
+--      tracks: [16, 2, 2]
+-+      tracks: [16, 18, 2]
+-     img_mean: [ 0., 0., 0. ]
+-     img_std: [ 1.0, 1.0, 1.0 ]
+-     num_views: 2
+-diff --git a/grid_points_diff.txt b/grid_points_diff.txt
+-deleted file mode 100644
+-index fd648c2..0000000
+---- a/grid_points_diff.txt
+-+++ /dev/null
+-@@ -1,238 +0,0 @@
+--diff --git a/atm/model/track_patch_embed.py b/atm/model/track_patch_embed.py
+--index 92864d0..5de29da 100644
+----- a/atm/model/track_patch_embed.py
+--+++ b/atm/model/track_patch_embed.py
+--@@ -11,7 +11,7 @@ class TrackPatchEmbed(nn.Module):
+--                  embed_dim):
+--         super().__init__()
+--         self.num_track_ts = num_track_ts
+---        self.num_track_ids = num_track_ids
+--+        self.num_track_ids = 18
+--         self.patch_size = patch_size
+--         self.in_dim = in_dim
+--         self.embed_dim = embed_dim
+--diff --git a/atm/model/track_transformer.py b/atm/model/track_transformer.py
+--index 4ddedaa..08e3e0e 100644
+----- a/atm/model/track_transformer.py
+--+++ b/atm/model/track_transformer.py
+--@@ -55,7 +55,9 @@ class TrackTransformer(nn.Module):
+-- 
+--     def _init_track_modules(self, dim, num_track_ts, num_track_ids, patch_size=1):
+--         self.num_track_ts = num_track_ts
+---        self.num_track_ids = num_track_ids
+--+        # self.num_track_ids = num_track_ids
+--+        self.num_track_ids = 18
+--+        print("HERE LOOK HERE self.num_track_ids", self.num_track_ids)
+--         self.track_patch_size = patch_size
+-- 
+--         self.track_proj_encoder = TrackPatchEmbed(
+--@@ -69,6 +71,11 @@ class TrackTransformer(nn.Module):
+--         self.num_track_ids = num_track_ids
+--         self.num_track_ts = num_track_ts
+-- 
+--+        print(f"TrackTransformer init - num_track_ts: {self.num_track_ts}")
+--+        print(f"TrackTransformer init - num_track_ids: {self.num_track_ids}")
+--+        print(f"TrackTransformer init - track_patch_size: {self.track_patch_size}")
+--+        print(f"TrackTransformer init - num_track_patches: {self.num_track_patches}")
+--+
+--         return self.track_proj_encoder, self.track_decoder
+-- 
+--     def _init_video_modules(self, dim, img_size, patch_size, frame_stack=1, img_mean=[.5, .5, .5], img_std=[.5, .5, .5]):
+--@@ -180,6 +187,7 @@ class TrackTransformer(nn.Module):
+--         B, T, _, _ = track.shape
+--         patches = self._encode_video(vid, p_img)  # (b, n_image, d)
+--         enc_track = self._encode_track(track)
+--+        print(f"TrackTransformer forward - enc_track shape: {enc_track.shape}")
+-- 
+--         text_encoded = self.language_encoder(task_emb)  # (b, c)
+--         text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
+--@@ -187,12 +195,40 @@ class TrackTransformer(nn.Module):
+--         x = torch.cat([enc_track, patches, text_encoded], dim=1)
+--         x = self.transformer(x)
+-- 
+--+        print(f"TrackTransformer forward - transformer output shape: {x.shape}")
+--+
+--+        # rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+--+        # rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+--+        # rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+--+
+--+        # rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+--+        # print(f"TrackTransformer forward - rec_track shape: {rec_track.shape}")
+--+        # print(f"TrackTransformer forward - self.num_track_patches: {self.num_track_patches}")
+--+        # print(f"TrackTransformer forward - self.track_patch_size: {self.track_patch_size}")
+--+        # rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+--+        # rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+--+        # print(f"TrackTransformer forward - rec_track shape after decoder: {rec_track.shape}")
+--+        
+--+        # num_track_h = self.num_track_ts // self.track_patch_size
+--+        # print(f"TrackTransformer forward - num_track_h: {num_track_h}")
+--+        # # rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
+--+        # rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h, n=self.num_track_ids)
+--+
+--+        # return rec_track, rec_patches
+--+
+--         rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+---        rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+---        rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+--+        print(f"TrackTransformer forward - rec_track shape: {rec_track.shape}")
+--+        print(f"TrackTransformer forward - self.num_track_patches: {self.num_track_patches}")
+--+        print(f"TrackTransformer forward - self.track_patch_size: {self.track_patch_size}")
+--+        rec_patches = self.img_decoder(rec_patches)
+--+        rec_track = self.track_decoder(rec_track)
+--+        print(f"TrackTransformer forward - rec_track shape after decoder: {rec_track.shape}")
+--+        
+--         num_track_h = self.num_track_ts // self.track_patch_size
+---        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
+---
+--+        print(f"TrackTransformer forward - num_track_h: {num_track_h}")
+--+        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h, n=self.num_track_ids)
+--+        print(f"TrackTransformer forward - rec_track shape after rearrange: {rec_track.shape}")
+--+    
+--         return rec_track, rec_patches
+-- 
+--     def reconstruct(self, vid, track, task_emb, p_img):
+--diff --git a/atm/policy/vilt.py b/atm/policy/vilt.py
+--index 8424aa4..ccffdce 100644
+----- a/atm/policy/vilt.py
+--+++ b/atm/policy/vilt.py
+--@@ -107,13 +107,16 @@ class BCViLTPolicy(nn.Module):
+-- 
+--         track_cfg.model_cfg.load_path = f"{track_fn}/model_best.ckpt"
+--         track_cls = eval(track_cfg.model_name)
+--+        self.num_track_ids = 18 ############
+--         self.track = track_cls(**track_cfg.model_cfg)
+--+        self.track.num_track_ids = 18 #############
+--         # freeze
+--         self.track.eval()
+--         for param in self.track.parameters():
+--             param.requires_grad = False
+-- 
+---        self.num_track_ids = self.track.num_track_ids
+--+        # self.num_track_ids = self.track.num_track_ids
+--+        self.num_track_ids = 18
+--         self.num_track_ts = self.track.num_track_ts
+--         self.policy_track_patch_size = self.track.track_patch_size if policy_track_patch_size is None else policy_track_patch_size
+-- 
+--@@ -203,6 +206,8 @@ class BCViLTPolicy(nn.Module):
+--         policy_head_kwargs["input_size"] \
+--             = self.temporal_embed_size + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
+-- 
+--+        print(f"Policy head input size: {policy_head_kwargs['input_size']}")
+--+
+--         action_shape = policy_head_kwargs["output_size"]
+--         self.act_shape = action_shape
+--         self.out_shape = np.prod(action_shape)
+--@@ -244,7 +249,13 @@ class BCViLTPolicy(nn.Module):
+--             task_emb: b e
+--         Returns: b v t track_len n 2
+--         """
+---        assert self.num_track_ids == 32
+--+        print(f"track_encode - track_obs shape: {track_obs.shape}")
+--+        print(f"track_encode - self.num_track_ts: {self.num_track_ts}")
+--+        print(f"track_encode - self.num_track_ids: {self.num_track_ids}")
+--+        print(f"track_encode - self.policy_track_patch_size: {self.policy_track_patch_size}")
+--+        # assert self.num_track_ids == 32
+--+        print("HERE LOOK HERE AGAIN self.num_track_ids", self.num_track_ids)
+--+        assert self.num_track_ids == 18
+--         b, v, t, *_ = track_obs.shape
+-- 
+--         if self.use_zero_track:
+--@@ -252,7 +263,9 @@ class BCViLTPolicy(nn.Module):
+--         else:
+--             track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
+-- 
+---            grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+--+            # grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+--+            # grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+--+            grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+--             grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+--             grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
+-- 
+--@@ -260,6 +273,7 @@ class BCViLTPolicy(nn.Module):
+--             expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
+--             with torch.no_grad():
+--                 pred_tr, _ = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
+--+                print(f"track_encode - pred_tr shape: {pred_tr.shape}") 
+--                 recon_tr = rearrange(pred_tr, "(b v t) tl n d -> b v t tl n d", b=b, v=v, t=t)
+-- 
+--         recon_tr = recon_tr[:, :, :, :self.policy_num_track_ts, :, :]  # truncate the track to a shorter one
+--@@ -385,7 +399,7 @@ class BCViLTPolicy(nn.Module):
+-- 
+--         recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
+--         x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
+---
+--+        print(f"Shape of x before policy_head: {x.shape}")
+--         dist = self.policy_head(x)  # only use the current timestep feature to predict action
+--         return dist
+-- 
+--@@ -439,7 +453,7 @@ class BCViLTPolicy(nn.Module):
+--             pad_track = repeat(last_track, "b v 1 n d -> b v tl n d", tl=self.num_track_ts-t)
+--             track = torch.cat([track, pad_track], dim=2)
+-- 
+---        grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+--+        grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+--         grid_track = repeat(grid_points, "n d -> b v tl n d", b=b, v=v, tl=self.num_track_ts)
+-- 
+--         all_ret_dict = {}
+--diff --git a/atm/policy/vilt_modules/policy_head.py b/atm/policy/vilt_modules/policy_head.py
+--index b00163a..494e62e 100644
+----- a/atm/policy/vilt_modules/policy_head.py
+--+++ b/atm/policy/vilt_modules/policy_head.py
+--@@ -32,6 +32,7 @@ class DeterministicHead(nn.Module):
+--         self.loss_coef = loss_coef
+-- 
+--     def forward(self, x):
+--+        print(f"DeterministicHead input shape: {x.shape}")
+--         y = self.net(x)
+--         return y
+-- 
+--diff --git a/atm/utils/flow_utils.py b/atm/utils/flow_utils.py
+--index c152517..80dc93a 100644
+----- a/atm/utils/flow_utils.py
+--+++ b/atm/utils/flow_utils.py
+--@@ -66,8 +66,10 @@ def sample_tracks_nearest_to_grids(tracks, vis, num_samples):
+--     Returns:
+--         (track_len num_samples 2)
+--     """
+---    assert num_samples == 32
+---    reference_grid_points = sample_double_grid(n=4, device="cpu")  # (32, 2)
+--+    # assert num_samples == 32
+--+    # reference_grid_points = sample_double_grid(n=4, device="cpu")  # (32, 2)
+--+    assert num_samples == 18
+--+    reference_grid_points = sample_double_grid(n=3, device="cpu")  # (32, 2)
+-- 
+--     first_points = tracks[0]  # (n, 2)
+--     dist = torch.norm(first_points[:, None, :] - reference_grid_points[None, :, :], dim=-1)  # (n, 32)
+--diff --git a/conf/train_bc/libero_vilt.yaml b/conf/train_bc/libero_vilt.yaml
+--index d72727f..2a823b1 100644
+----- a/conf/train_bc/libero_vilt.yaml
+--+++ b/conf/train_bc/libero_vilt.yaml
+--@@ -19,7 +19,7 @@ train_gpus: [0]
+-- 
+-- # Training
+-- lr: 5e-4
+---batch_size: 128
+--+batch_size: 16
+-- mix_precision: false
+-- num_workers: 8
+-- val_freq: 5
+--@@ -32,7 +32,8 @@ dry: false
+-- img_size: 128
+-- frame_stack: 10
+-- num_track_ts: 16
+---num_track_ids: 32
+--+# num_track_ids: 32
+--+num_track_ids: 18
+-- extra_state_keys: ["joint_states", "gripper_states"]
+-- 
+-- aug_prob: 0.9
+--@@ -69,7 +70,8 @@ model_cfg:
+--   obs_cfg:
+--     obs_shapes:
+--       rgb: [3, 128, 128]
+---      tracks: [16, 32, 2]
+--+      # tracks: [16, 32, 2]
+--+      tracks: [16, 18, 2]
+--     img_mean: [ 0., 0., 0. ]
+--     img_std: [ 1.0, 1.0, 1.0 ]
+--     num_views: 2
+diff --git a/atm/model/track_patch_embed.py b/atm/model/track_patch_embed.py
+index e4d75c9..a4bbe9b 100644
+--- a/atm/model/track_patch_embed.py
++++ b/atm/model/track_patch_embed.py
+@@ -11,7 +11,7 @@ class TrackPatchEmbed(nn.Module):
+                  embed_dim):
+         super().__init__()
+         self.num_track_ts = num_track_ts
+-        self.num_track_ids = 8
++        self.num_track_ids = 2
+         self.patch_size = patch_size
+         self.in_dim = in_dim
+         self.embed_dim = embed_dim
+diff --git a/atm/model/track_transformer.py b/atm/model/track_transformer.py
+index 66cf2bf..0a33beb 100644
+--- a/atm/model/track_transformer.py
++++ b/atm/model/track_transformer.py
+@@ -56,7 +56,7 @@ class TrackTransformer(nn.Module):
+     def _init_track_modules(self, dim, num_track_ts, num_track_ids, patch_size=1):
+         self.num_track_ts = num_track_ts
+         # self.num_track_ids = num_track_ids
+-        self.num_track_ids = 8
++        self.num_track_ids = 2
+         print("HERE LOOK HERE self.num_track_ids", self.num_track_ids)
+         self.track_patch_size = patch_size
+ 
+diff --git a/atm/policy/vilt.py b/atm/policy/vilt.py
+index e1097f4..419217f 100644
+--- a/atm/policy/vilt.py
++++ b/atm/policy/vilt.py
+@@ -107,16 +107,16 @@ class BCViLTPolicy(nn.Module):
+ 
+         track_cfg.model_cfg.load_path = f"{track_fn}/model_best.ckpt"
+         track_cls = eval(track_cfg.model_name)
+-        self.num_track_ids = 8 ############
++        self.num_track_ids = 2 ############
+         self.track = track_cls(**track_cfg.model_cfg)
+-        self.track.num_track_ids = 8 #############
++        self.track.num_track_ids = 2 #############
+         # freeze
+         self.track.eval()
+         for param in self.track.parameters():
+             param.requires_grad = False
+ 
+         # self.num_track_ids = self.track.num_track_ids
+-        self.num_track_ids = 8
++        self.num_track_ids = 2
+         self.num_track_ts = self.track.num_track_ts
+         self.policy_track_patch_size = self.track.track_patch_size if policy_track_patch_size is None else policy_track_patch_size
+ 
+@@ -255,7 +255,7 @@ class BCViLTPolicy(nn.Module):
+         print(f"track_encode - self.policy_track_patch_size: {self.policy_track_patch_size}")
+         # assert self.num_track_ids == 32
+         print("HERE LOOK HERE AGAIN self.num_track_ids", self.num_track_ids)
+-        assert self.num_track_ids == 8
++        assert self.num_track_ids == 2
+         b, v, t, *_ = track_obs.shape
+ 
+         if self.use_zero_track:
+@@ -265,7 +265,7 @@ class BCViLTPolicy(nn.Module):
+ 
+             # grid_points = sample_double_grid(3, device=track_obs.device, dtype=track_obs.dtype)
+             # grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+-            grid_points = sample_double_grid(2, device=track_obs.device, dtype=track_obs.dtype)
++            grid_points = sample_double_grid(1, device=track_obs.device, dtype=track_obs.dtype)
+             grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=self.num_track_ts)
+             grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
+ 
+@@ -453,7 +453,7 @@ class BCViLTPolicy(nn.Module):
+             pad_track = repeat(last_track, "b v 1 n d -> b v tl n d", tl=self.num_track_ts-t)
+             track = torch.cat([track, pad_track], dim=2)
+ 
+-        grid_points = sample_double_grid(2, device=track_obs.device, dtype=track_obs.dtype)
++        grid_points = sample_double_grid(1, device=track_obs.device, dtype=track_obs.dtype)
+         grid_track = repeat(grid_points, "n d -> b v tl n d", b=b, v=v, tl=self.num_track_ts)
+ 
+         all_ret_dict = {}
+diff --git a/atm/utils/flow_utils.py b/atm/utils/flow_utils.py
+index 6738e20..ead70da 100644
+--- a/atm/utils/flow_utils.py
++++ b/atm/utils/flow_utils.py
+@@ -68,7 +68,7 @@ def sample_tracks_nearest_to_grids(tracks, vis, num_samples):
+     """
+     # assert num_samples == 32
+     # reference_grid_points = sample_double_grid(n=4, device="cpu")  # (32, 2)
+-    assert num_samples == 8
++    assert num_samples == 2
+     reference_grid_points = sample_double_grid(n=3, device="cpu")  # (32, 2)
+ 
+     first_points = tracks[0]  # (n, 2)
+diff --git a/conf/train_bc/libero_vilt.yaml b/conf/train_bc/libero_vilt.yaml
+index d72f4e4..985f141 100644
+--- a/conf/train_bc/libero_vilt.yaml
++++ b/conf/train_bc/libero_vilt.yaml
+@@ -33,7 +33,7 @@ img_size: 128
+ frame_stack: 10
+ num_track_ts: 16
+ # num_track_ids: 32
+-num_track_ids: 8
++num_track_ids: 2
+ extra_state_keys: ["joint_states", "gripper_states"]
+ 
+ aug_prob: 0.9
+@@ -71,7 +71,7 @@ model_cfg:
+     obs_shapes:
+       rgb: [3, 128, 128]
+       # tracks: [16, 32, 2]
+-      tracks: [16, 8, 2]
++      tracks: [16, 2, 2]
+     img_mean: [ 0., 0., 0. ]
+     img_std: [ 1.0, 1.0, 1.0 ]
+     num_views: 2
