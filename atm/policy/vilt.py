@@ -73,7 +73,8 @@ class BCViLTPolicy(nn.Module):
             self.load(load_path)
             self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
             
-        self.additional_features_projection = nn.Linear(6144, 128)
+        # self.additional_features_projection = nn.Linear(6144, 128)
+        self.additional_features_projection = nn.Linear(384, 128)
 
         self.track_patch_pos_embed = nn.Parameter(torch.randn(1, self.num_track_patches, self.spatial_embed_size-self.track_id_embed_dim))
 
@@ -480,6 +481,28 @@ class BCViLTPolicy(nn.Module):
             print(f"Shape of additional_features after expansion: {additional_features.shape}")
             
             track_encoded = torch.cat([track_encoded, additional_features], dim=-1)
+
+        # if intermediate_outputs:
+        #     print(f"Number of intermediate outputs: {len(intermediate_outputs)}")
+        #     print(f"Shape of final layer output: {intermediate_outputs[0].shape}")
+            
+        #     # Get the last layer output
+        #     additional_features = intermediate_outputs[0]
+        #     print(f"Shape of additional_features before projection: {additional_features.shape}")
+            
+        #     # Project each token independently
+        #     additional_features = self.additional_features_projection(additional_features)
+        #     print(f"Shape of additional_features after projection: {additional_features.shape}")
+            
+        #     # Average across the sequence dimension (dim=1)
+        #     additional_features = additional_features.mean(dim=1)
+        #     print(f"Shape of additional_features after averaging: {additional_features.shape}")
+            
+        #     batch_size, time_dim, num_track_ids, *_ = track_encoded.shape
+        #     additional_features = additional_features.unsqueeze(1).unsqueeze(2).expand(batch_size, time_dim, num_track_ids, -1)
+        #     print(f"Shape of additional_features after expansion: {additional_features.shape}")
+            
+        #     track_encoded = torch.cat([track_encoded, additional_features], dim=-1)
         
         print(f"Final shape of track_encoded: {track_encoded.shape}")
 
