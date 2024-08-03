@@ -73,7 +73,8 @@ class BCViLTPolicy(nn.Module):
             self.load(load_path)
             self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
             
-        self.additional_features_projection = nn.Linear(6144, 128)
+        # self.additional_features_projection = nn.Linear(6144, 128)
+        self.additional_features_projection = nn.Linear(384, 128)
 
         self.track_patch_pos_embed = nn.Parameter(torch.randn(1, self.num_track_patches, self.spatial_embed_size-self.track_id_embed_dim))
 

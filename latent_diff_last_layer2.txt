@@ -1,0 +1,295 @@
+diff --git a/atm/model/track_transformer.py b/atm/model/track_transformer.py
+index 4ddedaa..6db9212 100644
+--- a/atm/model/track_transformer.py
++++ b/atm/model/track_transformer.py
+@@ -176,28 +176,47 @@ class TrackTransformer(nn.Module):
+         vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
+         task_emb, (b, emb_size)
+         """
+-        assert torch.max(vid) <=1.
++        assert torch.max(vid) <= 1.0
+         B, T, _, _ = track.shape
+         patches = self._encode_video(vid, p_img)  # (b, n_image, d)
+         enc_track = self._encode_track(track)
+-
++    
+         text_encoded = self.language_encoder(task_emb)  # (b, c)
+-        text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
+-
++        text_encoded = rearrange(text_encoded, "b c -> b 1 c")
++    
+         x = torch.cat([enc_track, patches, text_encoded], dim=1)
+         x = self.transformer(x)
+-
+-        rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+-        rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+-        rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
++    
++        transformer_output = x[:, -1, :]  # Get the output of the last layer for each batch
++    
++        # Decode the output
++        if self.track_decoder is not None:
++            rec_track = self.track_decoder(x[:, :self.num_track_patches])  # (b, (t n), 2 * patch_size)
++        else:
++            rec_track = torch.zeros_like(track)  # Initialize to zero if no decoder is present
++    
++        rec_patches = self.img_decoder(x[:, self.num_track_patches:-1])  # (b, n_image, 3 * t * patch_size ** 2)
++    
++        # Check the shape of rec_track after assignment
++        print(f"rec_track shape: {rec_track.shape}")
++        print(f"rec_patches shape: {rec_patches.shape}")
++        print(f"transformer_output shape: {transformer_output.shape}")
++    
+         num_track_h = self.num_track_ts // self.track_patch_size
+-        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
++        rec_track = rearrange(rec_track, "b (t n) (p c) -> b (t p) n c", p=self.track_patch_size, t=num_track_h)
++    
++        # Additional debug print statements to ensure alignment
++        print(f"Track Encoder Output Shape: {enc_track.shape}")
++        print(f"Patch Encoder Output Shape: {patches.shape}")
++    
++        return rec_track, rec_patches, transformer_output
++
++
+ 
+-        return rec_track, rec_patches
+ 
+     def reconstruct(self, vid, track, task_emb, p_img):
+         """
+-        wrapper of forward with preprocessing
++        Wrapper of forward with preprocessing
+         track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
+         vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
+         task_emb: (b, e)
+@@ -205,7 +224,7 @@ class TrackTransformer(nn.Module):
+         assert len(vid.shape) == 5  # b, t, c, h, w
+         track = self._preprocess_track(track)
+         vid = self._preprocess_vid(vid)
+-        return self.forward(vid, track, task_emb, p_img)
++        return self.forward(vid, track, task_emb, p_img)  # Now returns 3 outputs
+ 
+     def forward_loss(self,
+                      vid,
+@@ -261,7 +280,7 @@ class TrackTransformer(nn.Module):
+         track = self._preprocess_track(track)
+         vid = self._preprocess_vid(vid)
+ 
+-        rec_track, rec_patches = self.forward(vid, track, task_emb, p_img)
++        rec_track, rec_patches, transformer_output = self.forward(vid, track, task_emb, p_img)
+         track_loss = F.mse_loss(rec_track, track)
+         img_loss = F.mse_loss(rec_patches, self._patchify(vid))
+         loss = track_loss + img_loss
+@@ -291,8 +310,9 @@ class TrackTransformer(nn.Module):
+             "img_loss": img_loss.sum().item(),
+             "combined_image": combined_image.cpu().numpy().astype(np.uint8),
+             "combined_track_vid": combined_track_vid.cpu().numpy().astype(np.uint8),
++            "transformer_output": transformer_output.cpu().numpy(),  # Add this line if you want to include it in the return dict
+         }
+-
++    
+         return loss.sum(), ret_dict
+ 
+     def _patchify(self, imgs):
+diff --git a/atm/policy/vilt.py b/atm/policy/vilt.py
+index 8424aa4..dcc54cd 100644
+--- a/atm/policy/vilt.py
++++ b/atm/policy/vilt.py
+@@ -198,17 +198,28 @@ class BCViLTPolicy(nn.Module):
+         action_cls_token = nn.Parameter(torch.zeros(1, 1, self.temporal_embed_size))
+         nn.init.normal_(action_cls_token, std=1e-6)
+         self.register_parameter("action_cls_token", action_cls_token)
+-
++    
+     def _setup_policy_head(self, network_name, **policy_head_kwargs):
+-        policy_head_kwargs["input_size"] \
+-            = self.temporal_embed_size + self.num_views * self.policy_num_track_ts * self.policy_num_track_ids * 2
+-
++        # Assuming combined_input shape is correctly calculated as [160, 2880]
++        actual_input_size = 2880  # Updated to match the combined input size
++
++        # If you need an adjustment layer:
++        self.input_adjustment = nn.Linear(actual_input_size, 2496)
++        
++        # Set the input size for the policy head to 2496 if using adjustment layer
++        policy_head_kwargs["input_size"] = 2496
++        
+         action_shape = policy_head_kwargs["output_size"]
+         self.act_shape = action_shape
+         self.out_shape = np.prod(action_shape)
+         policy_head_kwargs["output_size"] = self.out_shape
++        
+         self.policy_head = eval(network_name)(**policy_head_kwargs)
+ 
++        print(f"Input adjustment layer: in_features={actual_input_size}, out_features={self.input_adjustment.out_features}")
++        print(f"Policy head input size: {policy_head_kwargs['input_size']}")
++        print(f"Policy head output size: {self.out_shape}")
++
+     @torch.no_grad()
+     def preprocess(self, obs, track, action):
+         """
+@@ -242,13 +253,14 @@ class BCViLTPolicy(nn.Module):
+         Args:
+             track_obs: b v t tt_fs c h w
+             task_emb: b e
+-        Returns: b v t track_len n 2
++        Returns: b v t track_len n 2, transformer_output
+         """
+         assert self.num_track_ids == 32
+         b, v, t, *_ = track_obs.shape
+ 
+         if self.use_zero_track:
+             recon_tr = torch.zeros((b, v, t, self.num_track_ts, self.num_track_ids, 2), device=track_obs.device, dtype=track_obs.dtype)
++            transformer_output = torch.zeros((b * v * t, self.track.dim), device=track_obs.device, dtype=track_obs.dtype)  # Initialize as zeros
+         else:
+             track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
+ 
+@@ -259,7 +271,8 @@ class BCViLTPolicy(nn.Module):
+             expand_task_emb = repeat(task_emb, "b e -> b v t e", b=b, v=v, t=t)
+             expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
+             with torch.no_grad():
+-                pred_tr, _ = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
++                # Unpack the three returned values correctly
++                pred_tr, _, transformer_output = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)
+                 recon_tr = rearrange(pred_tr, "(b v t) tl n d -> b v t tl n d", b=b, v=v, t=t)
+ 
+         recon_tr = recon_tr[:, :, :, :self.policy_num_track_ts, :, :]  # truncate the track to a shorter one
+@@ -271,7 +284,7 @@ class BCViLTPolicy(nn.Module):
+         tr = self.track_proj_encoder(tr_view)  # (b v t) track_patch_num n d
+         tr = rearrange(tr, "(b v t) pn n d -> (b t n) (v pn) d", b=b, v=v, t=t, n=self.num_track_ids)  # (b t n) (v patch_num) d
+ 
+-        return tr, _recon_tr
++        return tr, _recon_tr, transformer_output
+ 
+     def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False):
+         """
+@@ -281,7 +294,7 @@ class BCViLTPolicy(nn.Module):
+             track_obs: b v t tt_fs c h w, (0, 255)
+             task_emb: b e
+             extra_states: {k: b t n}
+-        Returns: out: (b t 2+num_extra c), recon_track: (b v t tl n 2)
++        Returns: out: (b t 2+num_extra c), recon_track: (b v t tl n 2), transformer_output
+         """
+         # 1. encode image
+         img_encoded = []
+@@ -304,7 +317,7 @@ class BCViLTPolicy(nn.Module):
+         text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
+ 
+         # 3. encode track
+-        track_encoded, _recon_track = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
++        track_encoded, _recon_track, transformer_output = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
+         # patch position embedding
+         tr_feat, tr_id_emb = track_encoded[:, :, :-self.track_id_embed_dim], track_encoded[:, :, -self.track_id_embed_dim:]
+         tr_feat += self.track_patch_pos_embed  # ((b t n), 2*patch_num, c)
+@@ -351,7 +364,7 @@ class BCViLTPolicy(nn.Module):
+         output = torch.cat(out_seq, -2)  # (b, t, 2 or 3 + num_extra, c')
+ 
+         if return_recon:
+-            output = (output, _recon_track)
++            return output, _recon_track, transformer_output  # Now returning transformer_output
+ 
+         return output
+ 
+@@ -372,46 +385,54 @@ class BCViLTPolicy(nn.Module):
+         return x[:, :, 0]  # (b, t, c)
+ 
+     def forward(self, obs, track_obs, track, task_emb, extra_states):
+-        """
+-        Return feature and info.
+-        Args:
+-            obs: b v t c h w
+-            track_obs: b v t tt_fs c h w
+-            track: b v t track_len n 2, not used for training, only preserved for unified interface
+-            extra_states: {k: b t e}
+-        """
+-        x, recon_track = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)  # x: (b, t, 2+num_extra, c), recon_track: (b, v, t, tl, n, 2)
++        x, recon_track, transformer_output = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)
+         x = self.temporal_encode(x)  # (b, t, c)
++    
++        B, T, C = x.shape
++        transformer_output_dim = transformer_output.size(-1)
++    
++        # Reshape x and recon_track to match transformer_output
++        x = x.reshape(B * T, -1)
++        recon_track = recon_track.reshape(B * T, -1)
++        transformer_output = transformer_output.reshape(B * T, -1)
++    
++        combined_input = torch.cat([x, recon_track, transformer_output], dim=-1)
++        
++        # Adjust input dimensions if needed
++        adjusted_input = self.input_adjustment(combined_input)
++        
++        dist = self.policy_head(adjusted_input)
++        return dist
++
++
+ 
+-        recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
+-        x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
+ 
+-        dist = self.policy_head(x)  # only use the current timestep feature to predict action
+-        return dist
+ 
+     def forward_loss(self, obs, track_obs, track, task_emb, extra_states, action):
+-        """
+-        Args:
+-            obs: b v t c h w
+-            track_obs: b v t tt_fs c h w
+-            track: b v t track_len n 2, not used for training, only preserved for unified interface
+-            task_emb: b emb_size
+-            action: b t act_dim
+-        """
+         obs, track, action = self.preprocess(obs, track, action)
++        print(f"Action shape after preprocess: {action.shape}")
++        
+         dist = self.forward(obs, track_obs, track, task_emb, extra_states)
++        print(f"Distribution shape: {dist.shape}")
++        
++        # Reshape dist to match action shape
++        dist = dist.view(action.shape)
++        
++        print(f"Reshaped distribution shape: {dist.shape}")
++        print(f"Action shape: {action.shape}")
++        
+         loss = self.policy_head.loss_fn(dist, action, reduction="mean")
+-
++    
+         ret_dict = {
+             "bc_loss": loss.sum().item(),
+         }
+-
++    
+         if not self.policy_head.deterministic:
+             # pseudo loss
+             sampled_action = dist.sample().detach()
+             mse_loss = F.mse_loss(sampled_action, action)
+             ret_dict["pseudo_sampled_action_mse_loss"] = mse_loss.sum().item()
+-
++    
+         ret_dict["loss"] = ret_dict["bc_loss"]
+         return loss.sum(), ret_dict
+ 
+diff --git a/atm/policy/vilt_modules/policy_head.py b/atm/policy/vilt_modules/policy_head.py
+index b00163a..a0a1676 100644
+--- a/atm/policy/vilt_modules/policy_head.py
++++ b/atm/policy/vilt_modules/policy_head.py
+@@ -39,5 +39,7 @@ class DeterministicHead(nn.Module):
+         return self.forward(x)
+ 
+     def loss_fn(self, act, target, reduction="mean"):
++        print("act shape", act.shape)
++        print("target shape", target.shape)
+         loss = F.mse_loss(act, target, reduction=reduction)
+         return loss * self.loss_coef
+diff --git a/conf/train_bc/libero_vilt.yaml b/conf/train_bc/libero_vilt.yaml
+index 28b41fa..ee3e129 100644
+--- a/conf/train_bc/libero_vilt.yaml
++++ b/conf/train_bc/libero_vilt.yaml
+@@ -110,7 +110,7 @@ model_cfg:
+     use_language_token: false
+   policy_head_cfg:
+     network_name: DeterministicHead
+-    output_size: [7,]
++    output_size: [7,]  # Adjust if needed
+     hidden_size: 1024
+     num_layers: 2
+     loss_coef: 1.0
