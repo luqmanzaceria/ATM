@@ -177,23 +177,29 @@ class TrackTransformer(nn.Module):
         task_emb, (b, emb_size)
         """
         assert torch.max(vid) <=1.
-        B, T, _, _ = track.shape
+        B, T, _, _ = track.shape if track is not None else (vid.shape[0], 0, 0, 0)
         patches = self._encode_video(vid, p_img)  # (b, n_image, d)
-        enc_track = self._encode_track(track)
-
+        enc_track = self._encode_track(track) if track is not None else None
+    
         text_encoded = self.language_encoder(task_emb)  # (b, c)
         text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
-
-        x = torch.cat([enc_track, patches, text_encoded], dim=1)
+    
+        if enc_track is not None:
+            x = torch.cat([enc_track, patches, text_encoded], dim=1)
+        else:
+            x = torch.cat([patches, text_encoded], dim=1)
         x = self.transformer(x)
-
-        rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
-        rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
-        rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
-        num_track_h = self.num_track_ts // self.track_patch_size
-        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
-
-        return rec_track, rec_patches
+    
+        if track is not None:
+            rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
+            rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
+            rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+            num_track_h = self.num_track_ts // self.track_patch_size
+            rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
+        else:
+            rec_track, rec_patches = None, self.img_decoder(x[:, :-1])
+    
+        return rec_track, rec_patches, x
 
     def reconstruct(self, vid, track, task_emb, p_img):
         """
@@ -203,7 +209,7 @@ class TrackTransformer(nn.Module):
         task_emb: (b, e)
         """
         assert len(vid.shape) == 5  # b, t, c, h, w
-        track = self._preprocess_track(track)
+        track = self._preprocess_track(track) if track is not None else None
         vid = self._preprocess_vid(vid)
         return self.forward(vid, track, task_emb, p_img)
 
@@ -255,36 +261,36 @@ class TrackTransformer(nn.Module):
         """
         b = vid.shape[0]
         assert b == 1, "only support batch size 1 for visualization"
-
+    
         H, W = self.img_size
         _vid = vid.clone()
         track = self._preprocess_track(track)
         vid = self._preprocess_vid(vid)
-
-        rec_track, rec_patches = self.forward(vid, track, task_emb, p_img)
+    
+        rec_track, rec_patches, _ = self.forward(vid, track, task_emb, p_img)
         track_loss = F.mse_loss(rec_track, track)
         img_loss = F.mse_loss(rec_patches, self._patchify(vid))
         loss = track_loss + img_loss
-
+    
         rec_image = self._unpatchify(rec_patches)
-
+    
         # place them side by side
         combined_image = torch.cat([vid[:, -1], rec_image[:, -1]], dim=-1)  # only visualize the current frame
         combined_image = self.img_unnormalizer(combined_image) * 255
         combined_image = torch.clamp(combined_image, 0, 255)
         combined_image = rearrange(combined_image, '1 c h w -> h w c')
-
+    
         track = track.clone()
         rec_track = rec_track.clone()
-
+    
         rec_track_vid = tracks_to_video(rec_track, img_size=H)
         track_vid = tracks_to_video(track, img_size=H)
-
+    
         combined_track_vid = torch.cat([track_vid, rec_track_vid], dim=-1)
-
+    
         _vid = torch.cat([_vid, _vid], dim=-1)
         combined_track_vid = _vid * .25 + combined_track_vid * .75
-
+    
         ret_dict = {
             "loss": loss.sum().item(),
             "track_loss": track_loss.sum().item(),
@@ -292,7 +298,7 @@ class TrackTransformer(nn.Module):
             "combined_image": combined_image.cpu().numpy().astype(np.uint8),
             "combined_track_vid": combined_track_vid.cpu().numpy().astype(np.uint8),
         }
-
+    
         return loss.sum(), ret_dict
 
     def _patchify(self, imgs):
