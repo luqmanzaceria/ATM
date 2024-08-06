@@ -1,0 +1,26 @@
+diff --git a/conf/train_bc/libero_vilt.yaml b/conf/train_bc/libero_vilt.yaml
+index 28b41fa..d72727f 100644
+--- a/conf/train_bc/libero_vilt.yaml
++++ b/conf/train_bc/libero_vilt.yaml
+@@ -19,7 +19,7 @@ train_gpus: [0]
+ 
+ # Training
+ lr: 5e-4
+-batch_size: 16
++batch_size: 128
+ mix_precision: false
+ num_workers: 8
+ val_freq: 5
+diff --git a/scripts/train_libero_policy_atm.py b/scripts/train_libero_policy_atm.py
+index 6a01256..d63e865 100755
+--- a/scripts/train_libero_policy_atm.py
++++ b/scripts/train_libero_policy_atm.py
+@@ -23,7 +23,7 @@ args = parser.parse_args()
+ # training configs
+ CONFIG_NAME = "libero_vilt"
+ 
+-train_gpu_ids = [0]
++train_gpu_ids = [0, 1, 2, 3]
+ NUM_DEMOS = 10
+ 
+ root_dir = "./data/atm_libero/"
