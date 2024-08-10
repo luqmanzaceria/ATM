@@ -68,7 +68,7 @@ def sample_tracks_nearest_to_grids(tracks, vis, num_samples):
     """
     # assert num_samples == 32
     # reference_grid_points = sample_double_grid(n=4, device="cpu")  # (32, 2)
-    assert num_samples == 8
+    assert num_samples == 512
     reference_grid_points = sample_double_grid(n=3, device="cpu")  # (32, 2)
 
     first_points = tracks[0]  # (n, 2)
