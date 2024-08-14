@@ -9,13 +9,27 @@ class BCDataset(BaseDataset):
     def __init__(self, track_obs_fs=1, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.track_obs_fs = track_obs_fs
+        self.task_names = self._get_task_names()
+        self.task_ids = {name: i for i, name in enumerate(self.task_names)}
+
+    def _get_task_names(self):
+        # Extract task names from the dataset
+        task_names = set()
+        for demo_path in self._demo_id_to_path.values():
+            parts = demo_path.split('/')
+            if 'libero_spatial' in parts:
+                idx = parts.index('libero_spatial')
+                if idx + 1 < len(parts):
+                    task_names.add(parts[idx + 1])
+        return sorted(task_names)
 
     def __getitem__(self, index):
         demo_id = self._index_to_demo_id[index]
         demo_start_index = self._demo_id_to_start_indices[demo_id]
-
+        demo_path = self._demo_id_to_path[demo_id]
+    
         time_offset = index - demo_start_index
-
+    
         if self.cache_all:
             demo = self._cache[demo_id]
             all_view_frames = []
@@ -41,7 +55,7 @@ class BCDataset(BaseDataset):
                 all_view_track_transformer_frames.append(
                     torch.stack([self._load_image_list_from_demo(demo, view, time_offset + t, num_frames=self.track_obs_fs, backward=True) for t in range(self.frame_stack)])
                 )  # t tt_fs c h w
-
+    
         all_view_tracks = []
         all_view_vis = []
         for view in self.views:
@@ -52,17 +66,17 @@ class BCDataset(BaseDataset):
                 all_time_step_vis.append(demo["root"][view]['vis'][track_start_index:track_start_index + self.num_track_ts])  # track_len n
             all_view_tracks.append(torch.stack(all_time_step_tracks, dim=0))
             all_view_vis.append(torch.stack(all_time_step_vis, dim=0))
-
+    
         obs = torch.stack(all_view_frames, dim=0)  # v t c h w
         track = torch.stack(all_view_tracks, dim=0)  # v t track_len n 2
         vi = torch.stack(all_view_vis, dim=0)  # v t track_len n
         track_transformer_obs = torch.stack(all_view_track_transformer_frames, dim=0)  # v t tt_fs c h w
-
+    
         # augment rgbs and tracks
         if np.random.rand() < self.aug_prob:
             obs, track = self.augmentor((obs / 255., track))
             obs = obs * 255.
-
+    
         # sample tracks
         sample_track, sample_vi = [], []
         for i in range(len(self.views)):
@@ -75,10 +89,16 @@ class BCDataset(BaseDataset):
             sample_vi.append(torch.stack(sample_vi_per_time, dim=0))
         track = torch.stack(sample_track, dim=0)
         vi = torch.stack(sample_vi, dim=0)
-
+    
         actions = demo["root"]["actions"][time_offset:time_offset + self.frame_stack]
         task_embs = demo["root"]["task_emb_bert"]
         extra_states = {k: v[time_offset:time_offset + self.frame_stack] for k, v in
                         demo['root']['extra_states'].items()}
-
-        return obs, track_transformer_obs, track, task_embs, actions, extra_states
+    
+        # Get the task name and ID
+        parts = demo_path.split('/')
+        idx = parts.index('libero_spatial')
+        task_name = parts[idx + 1] if idx + 1 < len(parts) else "unknown"
+        task_id = self.task_ids.get(task_name, -1)  # Use -1 for unknown tasks
+    
+        return obs, track_transformer_obs, track, task_embs, actions, extra_states, task_id

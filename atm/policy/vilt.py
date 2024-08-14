@@ -412,6 +412,7 @@ class BCViLTPolicy(nn.Module):
             task_emb: b emb_size
             action: b t act_dim
         """
+        task_emb.requires_grad_(True)
         obs, track, action = self.preprocess(obs, track, action)
         dist = self.forward(obs, track_obs, track, task_emb, extra_states)
         loss = self.policy_head.loss_fn(dist, action, reduction="mean")

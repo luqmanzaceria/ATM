@@ -22,25 +22,23 @@ from atm.utils.log_utils import MetricLogger, BestAvgLoss
 from atm.utils.env_utils import build_env
 from engine.utils import rollout, merge_results
 
-
 @hydra.main(config_path="../conf/train_bc", version_base="1.3")
 def main(cfg: DictConfig):
-    # Put the import here so that running on slurm does not have import error
     work_dir = HydraConfig.get().runtime.output_dir
     setup(cfg)
     OmegaConf.save(config=cfg, f=os.path.join(work_dir, "config.yaml"))
 
     train_dataset = BCDataset(dataset_dir=cfg.train_dataset, **cfg.dataset_cfg, aug_prob=cfg.aug_prob)
     train_loader = get_dataloader(train_dataset,
-                                      mode="train",
-                                      num_workers=cfg.num_workers,
-                                      batch_size=cfg.batch_size)
+                                  mode="train",
+                                  num_workers=cfg.num_workers,
+                                  batch_size=cfg.batch_size)
 
     train_vis_dataset = BCDataset(dataset_dir=cfg.train_dataset, vis=True, **cfg.dataset_cfg, aug_prob=cfg.aug_prob)
     train_vis_dataloader = get_dataloader(train_vis_dataset,
-                                              mode="train",
-                                              num_workers=1,
-                                              batch_size=1)
+                                          mode="train",
+                                          num_workers=1,
+                                          batch_size=1)
 
     val_dataset = BCDataset(dataset_dir=cfg.val_dataset, num_demos=cfg.val_num_demos, **cfg.dataset_cfg, aug_prob=0.)
     val_loader = get_dataloader(val_dataset, mode="val", num_workers=cfg.num_workers, batch_size=cfg.batch_size)
@@ -51,14 +49,17 @@ def main(cfg: DictConfig):
     fabric = Fabric(accelerator="cuda", devices=list(cfg.train_gpus), precision="bf16-mixed" if cfg.mix_precision else None, strategy="deepspeed")
     fabric.launch()
 
-    None if (cfg.dry or not fabric.is_global_zero) else init_wandb(cfg)
+    if fabric.is_global_zero and not cfg.dry:
+        try:
+            init_wandb(cfg)
+        except Exception as e:
+            print(f"Error initializing wandb: {e}")
 
     model_cls = eval(cfg.model_name)
     model = model_cls(**cfg.model_cfg)
     optimizer = setup_optimizer(cfg.optimizer_cfg, model)
     scheduler = setup_lr_scheduler(optimizer, cfg.scheduler_cfg)
 
-    # initialize the environments in each rank
     cfg.env_cfg.render_gpu_ids = cfg.env_cfg.render_gpu_ids[fabric.global_rank] if isinstance(cfg.env_cfg.render_gpu_ids, list) else cfg.env_cfg.render_gpu_ids
     env_num_each_rank = math.ceil(len(cfg.env_cfg.env_name) / fabric.world_size)
     env_idx_start_end = (env_num_each_rank * fabric.global_rank,  min(env_num_each_rank * (fabric.global_rank + 1), len(cfg.env_cfg.env_name)))
@@ -69,7 +70,6 @@ def main(cfg: DictConfig):
     model, optimizer = fabric.setup(model, optimizer)
     train_loader = fabric.setup_dataloaders(train_loader)
 
-    # Pick ckpt based on  the average of the last 5 epochs
     metric_logger = MetricLogger(delimiter=" ")
     best_loss_logger = BestAvgLoss(window_size=5)
 
@@ -80,6 +80,7 @@ def main(cfg: DictConfig):
             model,
             train_loader,
             optimizer,
+            cfg,
             cfg.clip_grad,
             mix_precision=cfg.mix_precision,
             scheduler=scheduler,
@@ -89,29 +90,35 @@ def main(cfg: DictConfig):
         metric_logger.update(**train_metrics)
 
         if fabric.is_global_zero:
-            None if cfg.dry else wandb.log(train_metrics, step=epoch)
+            if not cfg.dry:
+                wandb.log(train_metrics, step=epoch)
 
-            if epoch % cfg.val_freq == 0:
-                val_metrics = evaluate(model,
-                                          val_loader,
-                                          mix_precision=cfg.mix_precision,
-                                          tag="val")
+            val_metrics, val_task_losses = evaluate(model,
+                                                    val_loader,
+                                                    mix_precision=cfg.mix_precision,
+                                                    tag="val")
 
-                # Save best checkpoint
-                metric_logger.update(**val_metrics)
+            metric_logger.update(**val_metrics)
 
-                val_metrics = {**val_metrics}
-                loss_metric = val_metrics["val/loss"]
-                is_best = best_loss_logger.update_best(loss_metric, epoch)
+            loss_metric = val_metrics["val/loss"]
+            is_best = best_loss_logger.update_best(loss_metric, epoch)
 
-                if is_best:
-                    model.save(f"{work_dir}/model_best.ckpt")
-                    with open(f"{work_dir}/best_epoch.txt", "w") as f:
-                        f.write(
-                            "Best epoch: %d, Best %s: %.4f"
-                            % (epoch, "loss", best_loss_logger.best_loss)
-                        )
-                None if cfg.dry else wandb.log(val_metrics, step=epoch)
+            if is_best:
+                model.save(f"{work_dir}/model_best.ckpt")
+                with open(f"{work_dir}/best_epoch.txt", "w") as f:
+                    f.write(
+                        "Best epoch: %d, Best %s: %.4f"
+                        % (epoch, "loss", best_loss_logger.best_loss)
+                    )
+            
+            if not cfg.dry:
+                try:
+                    wandb.log({"val/loss": val_metrics["val/loss"]}, step=epoch)
+                    for task_name, task_loss in val_task_losses.items():
+                        wandb.log({f"val/task_loss/{task_name}": task_loss}, step=epoch)
+                    wandb.log({"val/best_loss": best_loss_logger.best_loss}, step=epoch)
+                except Exception as e:
+                    print(f"Error logging to wandb: {e}")
 
         if epoch % cfg.save_freq == 0:
             model.save(f"{work_dir}/model_{epoch}.ckpt")
@@ -150,33 +157,29 @@ def main(cfg: DictConfig):
         None if cfg.dry else print(f"finished training in {wandb.run.dir}")
         None if cfg.dry else wandb.finish()
 
-
-def run_one_epoch(fabric,
-                  model,
-                  dataloader,
-                  optimizer,
-                  clip_grad=1.0,
-                  mix_precision=False,
-                  scheduler=None,
-                  ):
-    """
-    Optimize the policy. Return a dictionary of the loss and any other metrics.
-    """
+def run_one_epoch(fabric, model, dataloader, optimizer, cfg, clip_grad=1.0, mix_precision=False, scheduler=None):
     tot_loss_dict, tot_items = {}, 0
+    task_losses = {task_name: [] for task_name in dataloader.dataset.task_names}
+    lang_grad_norms = []
+    total_loss = 0
+    total_bc_loss = 0
 
     model.train()
-    i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for batch_idx, (obs, track_obs, track, task_emb, action, extra_states, task_ids) in enumerate(tqdm(dataloader)):
         if mix_precision:
             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
+
+        task_emb.requires_grad_(True)
 
         loss, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
         optimizer.zero_grad()
         fabric.backward(loss)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+        lang_grad_norm = torch.norm(task_emb.grad).item() if task_emb.grad is not None else 0
+        lang_grad_norms.append(lang_grad_norm)
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
         optimizer.step()
 
         for k, v in ret_dict.items():
@@ -185,7 +188,30 @@ def run_one_epoch(fabric,
             tot_loss_dict[k] += v
         tot_items += 1
 
-        i += 1
+        for i, task_id in enumerate(task_ids):
+            task_name = dataloader.dataset.task_names[task_id.item()]
+            task_loss = ret_dict['bc_loss'] / len(task_ids)
+            task_losses[task_name].append(task_loss)
+
+        total_loss += loss.item()
+        total_bc_loss += ret_dict['bc_loss']
+
+    avg_task_losses = {k: sum(v) / len(v) for k, v in task_losses.items() if v}
+    avg_total_loss = total_loss / tot_items
+    avg_bc_loss = total_bc_loss / tot_items
+
+    if fabric.is_global_zero and not cfg.dry:
+        wandb.log({
+            "train/epoch_avg_loss": avg_total_loss,
+            "train/epoch_avg_bc_loss": avg_bc_loss,
+        })
+        
+        wandb.log({f"train/epoch_avg_bc_loss_{k}": v for k, v in avg_task_losses.items()})
+
+    avg_lang_grad_norm = sum(lang_grad_norms) / len(lang_grad_norms)
+    if fabric.is_global_zero:
+        if not cfg.dry:
+            wandb.log({"train/epoch_avg_lang_grad_norm": avg_lang_grad_norm})
 
     out_dict = {}
     for k, v in tot_loss_dict.items():
@@ -195,15 +221,14 @@ def run_one_epoch(fabric,
         scheduler.step()
 
     return out_dict
-
-
+    
 @torch.no_grad()
 def evaluate(model, dataloader, mix_precision=False, tag="val"):
     tot_loss_dict, tot_items = {}, 0
+    task_losses = {task_name: [] for task_name in dataloader.dataset.task_names}
     model.eval()
 
-    i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for obs, track_obs, track, task_emb, action, extra_states, task_ids in tqdm(dataloader):
         obs, track_obs, track, task_emb, action = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda(), action.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:
@@ -212,27 +237,32 @@ def evaluate(model, dataloader, mix_precision=False, tag="val"):
 
         _, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
 
-        i += 1
-
         for k, v in ret_dict.items():
             if k not in tot_loss_dict:
                 tot_loss_dict[k] = 0
             tot_loss_dict[k] += v
         tot_items += 1
 
+        for i, task_id in enumerate(task_ids):
+            task_name = dataloader.dataset.task_names[task_id.item()]
+            task_loss = ret_dict['bc_loss'] / len(task_ids)
+            task_losses[task_name].append(task_loss)
+
     out_dict = {}
     for k, v in tot_loss_dict.items():
         out_dict[f"{tag}/{k}"] = tot_loss_dict[f"{k}"] / tot_items
 
-    return out_dict
+    avg_task_losses = {k: sum(v) / len(v) for k, v in task_losses.items() if v}
+    out_dict.update({f"{tag}/avg_bc_loss_{k}": v for k, v in avg_task_losses.items()})
 
+    return out_dict, avg_task_losses
 
 @torch.no_grad()
 def visualize(model, dataloader, mix_precision=False):
     model.eval()
     keep_eval_dict = None
 
-    for obs, track_obs, track, task_emb, action, extra_states in dataloader:
+    for obs, track_obs, track, task_emb, action, extra_states, task_ids in dataloader:
         obs, track_obs, track, task_emb = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:
@@ -244,14 +274,10 @@ def visualize(model, dataloader, mix_precision=False):
 
     return keep_eval_dict
 
-
 def setup(cfg):
     import warnings
-
     warnings.simplefilter("ignore")
-
     lightning.seed_everything(cfg.seed)
-
 
 if __name__ == "__main__":
     main()
