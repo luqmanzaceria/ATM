@@ -32,7 +32,7 @@ class DeterministicHead(nn.Module):
         self.loss_coef = loss_coef
 
     def forward(self, x):
-        print(f"Shape of x in DeterministicHead: {x.shape}")
+        # print(f"Shape of x in DeterministicHead: {x.shape}")
         y = self.net(x)
         return y
 

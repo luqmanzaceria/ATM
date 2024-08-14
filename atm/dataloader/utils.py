@@ -1,6 +1,7 @@
 import numpy as np
 from PIL import Image
 from einops import repeat
+import torch
 import torchvision
 from torch.utils.data import DataLoader
 import torch.nn as nn
@@ -11,16 +12,32 @@ import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.models.obs_core import CropRandomizer
 
 
-def get_dataloader(replay, mode, num_workers, batch_size):
-    loader = DataLoader(
-        replay,
-        shuffle=(mode == "train"),
-        pin_memory=True,
+def custom_collate_fn(batch):
+    # Separate the task_ids from the rest of the data
+    obs, track_transformer_obs, track, task_embs, actions, extra_states, task_ids = zip(*batch)
+    
+    # Collate the data
+    collated_data = (
+        torch.stack(obs),
+        torch.stack(track_transformer_obs),
+        torch.stack(track),
+        torch.stack(task_embs),
+        torch.stack(actions),
+        {k: torch.stack([d[k] for d in extra_states]) for k in extra_states[0]},
+        torch.tensor(task_ids)
+    )
+    return collated_data
+
+def get_dataloader(dataset, mode="train", num_workers=4, batch_size=32):
+    return DataLoader(
+        dataset,
         batch_size=batch_size,
+        shuffle=(mode == "train"),
         num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=True,
         prefetch_factor=4 if num_workers > 0 else None
     )
-    return loader
 
 
 def load_rgb(file_name):
