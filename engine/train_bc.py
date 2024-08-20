@@ -91,19 +91,23 @@ def main(cfg: DictConfig):
         if fabric.is_global_zero:
             None if cfg.dry else wandb.log(train_metrics, step=epoch)
 
+            # Log the histogram only if the tensor is available
+            if train_metrics.get("train/lang_grad_hist") is not None:
+                wandb.log({"train/lang_grad_hist": wandb.Histogram(train_metrics["train/lang_grad_hist"].numpy())}, step=epoch)
+        
             if epoch % cfg.val_freq == 0:
                 val_metrics = evaluate(model,
-                                          val_loader,
-                                          mix_precision=cfg.mix_precision,
-                                          tag="val")
-
+                                       val_loader,
+                                       mix_precision=cfg.mix_precision,
+                                       tag="val")
+        
                 # Save best checkpoint
                 metric_logger.update(**val_metrics)
-
+        
                 val_metrics = {**val_metrics}
                 loss_metric = val_metrics["val/loss"]
                 is_best = best_loss_logger.update_best(loss_metric, epoch)
-
+        
                 if is_best:
                     model.save(f"{work_dir}/model_best.ckpt")
                     with open(f"{work_dir}/best_epoch.txt", "w") as f:
@@ -112,7 +116,7 @@ def main(cfg: DictConfig):
                             % (epoch, "loss", best_loss_logger.best_loss)
                         )
                 None if cfg.dry else wandb.log(val_metrics, step=epoch)
-
+        
         if epoch % cfg.save_freq == 0:
             model.save(f"{work_dir}/model_{epoch}.ckpt")
 
@@ -151,32 +155,33 @@ def main(cfg: DictConfig):
         None if cfg.dry else wandb.finish()
 
 
-def run_one_epoch(fabric,
-                  model,
-                  dataloader,
-                  optimizer,
-                  clip_grad=1.0,
-                  mix_precision=False,
-                  scheduler=None,
-                  ):
-    """
-    Optimize the policy. Return a dictionary of the loss and any other metrics.
-    """
+def run_one_epoch(fabric, model, dataloader, optimizer, clip_grad=1.0, mix_precision=False, scheduler=None):
     tot_loss_dict, tot_items = {}, 0
+    task_losses = {}
+    lang_grad_norms = []
+    lang_grads = []
 
     model.train()
-    i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for batch_idx, batch in enumerate(tqdm(dataloader)):
+        obs, track_obs, track, task_emb, action, extra_states, task_name = batch
+
         if mix_precision:
             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
+
+        task_emb.requires_grad_(True)
 
         loss, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
         optimizer.zero_grad()
         fabric.backward(loss)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+        # Calculate gradient magnitude and store actual gradients
+        if task_emb.grad is not None:
+            lang_grad_norm = torch.norm(task_emb.grad).item()
+            lang_grad_norms.append(lang_grad_norm)
+            lang_grads.append(task_emb.grad.clone().cpu())  # Full tensor for histogram
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
         optimizer.step()
 
         for k, v in ret_dict.items():
@@ -185,25 +190,55 @@ def run_one_epoch(fabric,
             tot_loss_dict[k] += v
         tot_items += 1
 
-        i += 1
+        # Accumulate losses for each task
+        if isinstance(task_name, list):
+            for tn in task_name:
+                if tn not in task_losses:
+                    task_losses[tn] = []
+                task_losses[tn].append(ret_dict['bc_loss'])
+        else:
+            if task_name not in task_losses:
+                task_losses[task_name] = []
+            task_losses[task_name].append(ret_dict['bc_loss'])
 
     out_dict = {}
     for k, v in tot_loss_dict.items():
         out_dict[f"train/{k}"] = tot_loss_dict[f"{k}"] / tot_items
+
+    # Calculate average losses for each task
+    avg_task_losses = {f"train/{k}_loss": sum(v) / len(v) for k, v in task_losses.items() if v}
+    out_dict.update(avg_task_losses)
+
+    # Calculate average language gradient norm
+    if lang_grad_norms:
+        out_dict["train/lang_grad_norm"] = sum(lang_grad_norms) / len(lang_grad_norms)
+    else:
+        out_dict["train/lang_grad_norm"] = 0.0
+
+    # Store average language gradients as a scalar and tensor for logging
+    if lang_grads:
+        avg_lang_grad = torch.stack(lang_grads).mean(0)
+        out_dict["train/lang_grad"] = avg_lang_grad.mean().item()  # Scalar for overall logging
+        out_dict["train/lang_grad_hist"] = avg_lang_grad  # Full tensor for histogram
+    else:
+        out_dict["train/lang_grad"] = 0.0
+        out_dict["train/lang_grad_hist"] = None
 
     if scheduler is not None:
         scheduler.step()
 
     return out_dict
 
-
+    
 @torch.no_grad()
 def evaluate(model, dataloader, mix_precision=False, tag="val"):
     tot_loss_dict, tot_items = {}, 0
+    task_losses = {}
     model.eval()
 
-    i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for batch_idx, batch in enumerate(tqdm(dataloader)):
+        obs, track_obs, track, task_emb, action, extra_states, task_name = batch
+
         obs, track_obs, track, task_emb, action = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda(), action.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:
@@ -212,17 +247,30 @@ def evaluate(model, dataloader, mix_precision=False, tag="val"):
 
         _, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
 
-        i += 1
-
         for k, v in ret_dict.items():
             if k not in tot_loss_dict:
                 tot_loss_dict[k] = 0
             tot_loss_dict[k] += v
         tot_items += 1
 
+        # Accumulate losses for each task
+        if isinstance(task_name, list):
+            for tn in task_name:
+                if tn not in task_losses:
+                    task_losses[tn] = []
+                task_losses[tn].append(ret_dict['bc_loss'])
+        else:
+            if task_name not in task_losses:
+                task_losses[task_name] = []
+            task_losses[task_name].append(ret_dict['bc_loss'])
+
     out_dict = {}
     for k, v in tot_loss_dict.items():
         out_dict[f"{tag}/{k}"] = tot_loss_dict[f"{k}"] / tot_items
+
+    # Calculate average losses for each task
+    avg_task_losses = {f"{tag}/{k}_loss": sum(v) / len(v) for k, v in task_losses.items() if v}
+    out_dict.update(avg_task_losses)
 
     return out_dict
 
@@ -232,7 +280,7 @@ def visualize(model, dataloader, mix_precision=False):
     model.eval()
     keep_eval_dict = None
 
-    for obs, track_obs, track, task_emb, action, extra_states in dataloader:
+    for obs, track_obs, track, task_emb, action, extra_states, *extra in dataloader:
         obs, track_obs, track, task_emb = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:

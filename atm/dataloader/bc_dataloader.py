@@ -10,6 +10,14 @@ class BCDataset(BaseDataset):
         super().__init__(*args, **kwargs)
         self.track_obs_fs = track_obs_fs
 
+    def get_task_name(self, demo_id):
+        demo_pth = self._demo_id_to_path[demo_id]
+        # Extract task name from the demo path
+        # print("demo_pth: ",demo_pth)
+        task_name = demo_pth.split('/')[-3]  # Assumes task name is the third-to-last part of the path
+        # print("task_name: ", task_name)
+        return task_name
+
     def __getitem__(self, index):
         demo_id = self._index_to_demo_id[index]
         demo_start_index = self._demo_id_to_start_indices[demo_id]
@@ -81,4 +89,6 @@ class BCDataset(BaseDataset):
         extra_states = {k: v[time_offset:time_offset + self.frame_stack] for k, v in
                         demo['root']['extra_states'].items()}
 
-        return obs, track_transformer_obs, track, task_embs, actions, extra_states
+        task_name = self.get_task_name(demo_id)
+    
+        return obs, track_transformer_obs, track, task_embs, actions, extra_states, task_name
