@@ -81,6 +81,25 @@ class BCViLTPolicy(nn.Module):
         self.latent_queue = deque(maxlen=max_seq_len)
         self.track_obs_queue = deque(maxlen=max_seq_len)
 
+    def get_language_gradient_norms(self):
+        spatial_norm = 0
+        temporal_norm = 0
+        for name, p in self.named_parameters():
+            if 'language_encoder_spatial' in name and p.grad is not None:
+                spatial_norm += p.grad.data.norm(2).item() ** 2
+            elif 'language_encoder_temporal' in name and p.grad is not None:
+                temporal_norm += p.grad.data.norm(2).item() ** 2
+        
+        spatial_norm = spatial_norm ** 0.5
+        temporal_norm = temporal_norm ** 0.5
+        total_norm = (spatial_norm ** 2 + temporal_norm ** 2) ** 0.5
+        
+        return {
+            "spatial_language_grad_norm": spatial_norm,
+            "temporal_language_grad_norm": temporal_norm,
+            "total_language_grad_norm": total_norm
+        }
+    
     def _setup_image_encoder(self, network_name, patch_size, embed_size, no_patch_embed_bias):
         self.spatial_embed_size = embed_size
         self.image_encoders = []
@@ -94,7 +113,10 @@ class BCViLTPolicy(nn.Module):
         self.img_num_patches = sum([x.num_patches for x in self.image_encoders])
 
     def _setup_language_encoder(self, network_name, **language_encoder_kwargs):
-        return eval(network_name)(**language_encoder_kwargs)
+        language_encoder = eval(network_name)(**language_encoder_kwargs)
+        for param in language_encoder.parameters():
+            param.requires_grad = True
+        return language_encoder
 
     def _setup_track(self, track_fn, policy_track_patch_size=None, use_zero_track=False):
         """

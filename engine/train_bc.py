@@ -8,6 +8,8 @@ import torch.distributed as dist
 import lightning
 from lightning.fabric import Fabric
 
+import matplotlib.pyplot as plt
+
 import os
 import wandb
 import json
@@ -73,9 +75,13 @@ def main(cfg: DictConfig):
     metric_logger = MetricLogger(delimiter=" ")
     best_loss_logger = BestAvgLoss(window_size=5)
 
+    all_spatial_language_gradients = []
+    all_temporal_language_gradients = []
+    all_total_language_gradients = []
+
     fabric.barrier()
     for epoch in metric_logger.log_every(range(cfg.epochs), 1, ""):
-        train_metrics = run_one_epoch(
+        train_metrics, language_gradients = run_one_epoch(
             fabric,
             model,
             train_loader,
@@ -85,11 +91,36 @@ def main(cfg: DictConfig):
             scheduler=scheduler,
         )
 
+        # Accumulate language gradients
+        all_spatial_language_gradients.extend([g['spatial_language_grad_norm'] for g in language_gradients])
+        all_temporal_language_gradients.extend([g['temporal_language_grad_norm'] for g in language_gradients])
+        all_total_language_gradients.extend([g['total_language_grad_norm'] for g in language_gradients])
+
         train_metrics["train/lr"] = optimizer.param_groups[0]["lr"]
         metric_logger.update(**train_metrics)
 
         if fabric.is_global_zero:
             None if cfg.dry else wandb.log(train_metrics, step=epoch)
+
+            # Create and save language gradient plot
+            plt.figure(figsize=(12, 6))
+            plt.plot(range(len(all_spatial_language_gradients)), all_spatial_language_gradients, label='Spatial')
+            plt.plot(range(len(all_temporal_language_gradients)), all_temporal_language_gradients, label='Temporal')
+            plt.plot(range(len(all_total_language_gradients)), all_total_language_gradients, label='Total')
+            plt.title(f"Language Gradient Norms over Training Steps (Epoch {epoch})")
+            plt.xlabel("Training Step")
+            plt.ylabel("Gradient Norm")
+            plt.legend()
+            plt.savefig(os.path.join(work_dir, f"language_gradient_plot.png"))
+            plt.close()
+
+            # Log to wandb
+            None if cfg.dry else wandb.log({
+                "language_gradient_plot": wandb.Image(os.path.join(work_dir, f"language_gradient_plot.png")),
+                "spatial_language_grad_norm": all_spatial_language_gradients[-1],
+                "temporal_language_grad_norm": all_temporal_language_gradients[-1],
+                "total_language_grad_norm": all_total_language_gradients[-1]
+            }, step=epoch)
 
             if epoch % cfg.val_freq == 0:
                 val_metrics = evaluate(model,
@@ -144,6 +175,7 @@ def main(cfg: DictConfig):
 
                 metric_logger.update(**results)
         fabric.barrier()
+    
 
     if fabric.is_global_zero:
         model.save(f"{work_dir}/model_final.ckpt")
@@ -159,13 +191,10 @@ def run_one_epoch(fabric,
                   mix_precision=False,
                   scheduler=None,
                   ):
-    """
-    Optimize the policy. Return a dictionary of the loss and any other metrics.
-    """
     tot_loss_dict, tot_items = {}, 0
+    language_gradients = []
 
     model.train()
-    i = 0
     for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
         if mix_precision:
             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
@@ -175,8 +204,11 @@ def run_one_epoch(fabric,
         optimizer.zero_grad()
         fabric.backward(loss)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
+        # Store language gradients after backward
+        language_grad_norms = model.get_language_gradient_norms()
+        language_gradients.append(language_grad_norms)
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
         optimizer.step()
 
         for k, v in ret_dict.items():
@@ -185,8 +217,6 @@ def run_one_epoch(fabric,
             tot_loss_dict[k] += v
         tot_items += 1
 
-        i += 1
-
     out_dict = {}
     for k, v in tot_loss_dict.items():
         out_dict[f"train/{k}"] = tot_loss_dict[f"{k}"] / tot_items
@@ -194,7 +224,7 @@ def run_one_epoch(fabric,
     if scheduler is not None:
         scheduler.step()
 
-    return out_dict
+    return out_dict, language_gradients
 
 
 @torch.no_grad()
