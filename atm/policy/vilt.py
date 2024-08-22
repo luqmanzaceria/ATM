@@ -64,8 +64,15 @@ class BCViLTPolicy(nn.Module):
         # 8. define policy head
         self._setup_policy_head(**policy_head_cfg)
 
-        self.track_proj1 = nn.Linear(49536, self.spatial_embed_size)  # Adjust input size as needed
-        self.track_proj2 = nn.Linear(256, self.spatial_embed_size)
+        # self.track_proj1 = nn.Linear(49536, self.spatial_embed_size)  # Adjust input size as needed
+        # self.track_proj2 = nn.Linear(256, self.spatial_embed_size)
+
+        # Define the shared MLP to handle the correct input size
+        self.shared_mlp = nn.Sequential(
+            nn.Linear(49536, 128),  # Adjusted to match the input size of the track features
+            nn.ReLU(),
+            nn.Linear(128, self.spatial_embed_size)
+        )
     
 
         if load_path is not None:
@@ -299,31 +306,17 @@ class BCViLTPolicy(nn.Module):
         text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
     
         # 3. encode track
-        track_encoded = self._encode_track(track_obs, task_emb)  # track_encoded: (b, v, t, cls_dim + track_rep_dim)
-        print(f"track_encoded shape: {track_encoded.shape}")
+        track_encoded = self._encode_track(track_obs, task_emb)  # Shape: (b, v, t, 49536)
+        track_encoded = rearrange(track_encoded, 'b v t c -> (b v t) c')  # Flatten for shared MLP application
         
-        track_encoded = rearrange(track_encoded, 'b v t c -> (b t) v c')
-        print(f"track_encoded shape after rearrange: {track_encoded.shape}")
-        
-        # Project track_encoded to match the embedding size
-        track_encoded = self.track_proj1(track_encoded)
-        print(f"track_encoded shape after projection: {track_encoded.shape}")
-        
-        # Reshape back to (b, t, v, c)
-        track_encoded = rearrange(track_encoded, '(b t) v c -> b t v c', b=B, t=T)
-        
-        # Adjust track_pos_embed to match the dimensions of track_encoded
-        track_pos_embed = self.track_pos_embed.expand(B, T, self.num_views, -1)
-        print(f"track_pos_embed shape: {track_pos_embed.shape}")
-        
-        track_encoded += track_pos_embed  # (b, t, v, c)
-        
-        # Flatten the view dimension
-        track_encoded = rearrange(track_encoded, 'b t v c -> b t (v c)')
-        track_encoded = self.track_proj2(track_encoded)
-        print(f"final track_encoded shape: {track_encoded.shape}")
+        # Apply shared MLP to each track representation
+        track_encoded = self.shared_mlp(track_encoded)  # Apply shared MLP, Shape after MLP: (b*v*t, spatial_embed_size)
+        track_encoded = rearrange(track_encoded, '(b v t) c -> b t v c', b=B, v=self.num_views, t=T)  # Reshape back to (b, t, v, c)
     
-        # 3. concat img + track + text embs then add modality embeddings
+        # Max pooling across views
+        track_encoded, _ = torch.max(track_encoded, dim=2)  # Max pooling across views, Shape: (b, t, c)
+    
+        # 4. concat img + track + text embs then add modality embeddings
         if self.spatial_transformer_use_text:
             img_track_text_encoded = torch.cat([img_encoded, track_encoded.unsqueeze(2), text_encoded], -2)  # (b, t, 2*num_img_patch + 1 + 1, c)
             img_track_text_encoded += self.modality_embed[None, :, self.modality_idx, :]
@@ -331,23 +324,23 @@ class BCViLTPolicy(nn.Module):
             img_track_text_encoded = torch.cat([img_encoded, track_encoded.unsqueeze(2)], -2)  # (b, t, 2*num_img_patch + 1, c)
             img_track_text_encoded += self.modality_embed[None, :, self.modality_idx[:-1], :]
     
-        # 4. add spatial token
+        # 5. add spatial token
         spatial_token = self.spatial_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c)
         encoded = torch.cat([spatial_token, img_track_text_encoded], -2)  # (b, t, 1 + 2*num_img_patch + 1 + 1, c)
     
-        # 5. pass through transformer
-        encoded = rearrange(encoded, "b t n c -> (b t) n c")  # (b*t, 1 + 2*num_img_patch + v + 1, c)
+        # 6. pass through transformer
+        encoded = rearrange(encoded, "b t n c -> (b t) n c")  # (b*t, 1 + 2*num_img_patch + 1 + 1, c)
         out = self.spatial_transformer(encoded)
         out = out[:, 0]  # extract spatial token as summary at o_t
         out = self.spatial_downsample(out).view(B, T, 1, -1)  # (b, t, 1, c')
     
-        # 6. encode extra states
+        # 7. encode extra states
         if self.extra_encoder is None:
             extra = None
         else:
             extra = self.extra_encoder(extra_states)  # (B, T, num_extra, c')
     
-        # 7. encode language, treat it as action token
+        # 8. encode language, treat it as action token
         text_encoded_ = self.language_encoder_temporal(task_emb)  # (b, c')
         text_encoded_ = text_encoded_.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c')
         action_cls_token = self.action_cls_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c')
@@ -364,6 +357,7 @@ class BCViLTPolicy(nn.Module):
             output = (output, None)  # We're not using reconstructed tracks anymore
     
         return output
+
 
     def temporal_encode(self, x):
         """
