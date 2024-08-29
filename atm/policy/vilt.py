@@ -17,6 +17,8 @@ from atm.policy.vilt_modules.extra_state_modules import ExtraModalityTokens
 from atm.policy.vilt_modules.policy_head import *
 from atm.utils.flow_utils import ImageUnNormalize, sample_double_grid, tracks_to_video
 
+from atm.model.track_transformer import FiLMLayer
+
 ###############################################################################
 #
 # A ViLT Policy
@@ -66,8 +68,10 @@ class BCViLTPolicy(nn.Module):
 
         self.track_proj1 = nn.Linear(49536, self.spatial_embed_size)  # Adjust input size as needed
         self.track_proj2 = nn.Linear(256, self.spatial_embed_size)
-    
 
+        self.film_layer = FiLMLayer(self.spatial_embed_size, self.spatial_embed_size)
+        self.language_proj_spatial = nn.Linear(self.spatial_embed_size * 2, self.spatial_embed_size)
+    
         if load_path is not None:
             self.load(load_path)
             self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
@@ -98,7 +102,13 @@ class BCViLTPolicy(nn.Module):
         self.img_num_patches = sum([x.num_patches for x in self.image_encoders])
 
     def _setup_language_encoder(self, network_name, **language_encoder_kwargs):
-        return eval(network_name)(**language_encoder_kwargs)
+        language_output_size = self.spatial_embed_size * 2  # Double the size
+        
+        # Remove 'output_size' from kwargs if it exists
+        language_encoder_kwargs.pop('output_size', None)
+        
+        # Now pass output_size explicitly
+        return eval(network_name)(output_size=language_output_size, **language_encoder_kwargs)
 
     def _setup_track(self, track_fn, policy_track_patch_size=None, use_zero_track=False):
         """
@@ -295,7 +305,8 @@ class BCViLTPolicy(nn.Module):
         B, T = img_encoded.shape[:2]
     
         # 2. encode task_emb
-        text_encoded = self.language_encoder_spatial(task_emb)  # (b, c)
+        text_encoded = self.language_encoder_spatial(task_emb)  # (b, c*2)
+        text_encoded = self.language_proj_spatial(text_encoded)  # (b, c)
         text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
     
         # 3. encode track
@@ -322,14 +333,25 @@ class BCViLTPolicy(nn.Module):
         track_encoded = rearrange(track_encoded, 'b t v c -> b t (v c)')
         track_encoded = self.track_proj2(track_encoded)
         print(f"final track_encoded shape: {track_encoded.shape}")
-    
+        
+        # Concatenate image and track embeddings
+        img_track_encoded = torch.cat([img_encoded, track_encoded.unsqueeze(2)], -2)  # (b, t, num_img_patch + 1, c)
+        
+        # Expand text_encoded to match the time dimension of img_track_encoded
+        text_encoded_expanded = text_encoded.expand(-1, img_track_encoded.shape[1], -1, -1)
+        
+        # Apply FiLM layer
+        img_track_encoded = self.film_layer(img_track_encoded, text_encoded_expanded)
+        
         # 3. concat img + track + text embs then add modality embeddings
         if self.spatial_transformer_use_text:
-            img_track_text_encoded = torch.cat([img_encoded, track_encoded.unsqueeze(2), text_encoded], -2)  # (b, t, 2*num_img_patch + 1 + 1, c)
+            img_track_text_encoded = torch.cat([img_track_encoded, text_encoded], -2)  # (b, t, num_img_patch + 1 + 1, c)
             img_track_text_encoded += self.modality_embed[None, :, self.modality_idx, :]
         else:
-            img_track_text_encoded = torch.cat([img_encoded, track_encoded.unsqueeze(2)], -2)  # (b, t, 2*num_img_patch + 1, c)
+            img_track_text_encoded = img_track_encoded  # (b, t, num_img_patch + 1, c)
             img_track_text_encoded += self.modality_embed[None, :, self.modality_idx[:-1], :]
+        
+        print(f"img_track_text_encoded shape: {img_track_text_encoded.shape}")
     
         # 4. add spatial token
         spatial_token = self.spatial_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c)

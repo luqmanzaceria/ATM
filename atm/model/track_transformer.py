@@ -12,6 +12,8 @@ from atm.policy.vilt_modules.language_modules import *
 from .track_patch_embed import TrackPatchEmbed
 from .transformer import Transformer
 
+from atm.model.film import FiLMLayer
+
 class TrackTransformer(nn.Module):
     """
     flow video model using a BERT transformer
@@ -37,6 +39,8 @@ class TrackTransformer(nn.Module):
         self.img_proj_encoder, self.img_decoder = self._init_video_modules(**vid_cfg, dim=dim)
         self.language_encoder = self._init_language_encoder(output_size=dim, **language_encoder_cfg)
         self._init_weights(self.dim, self.num_img_patches)
+
+        self.film_layer = FiLMLayer(dim, dim)
 
         print(f"TrackTransformer: Image size: {self.img_size}")
         print(f"TrackTransformer: Patch size: {self.img_proj_encoder.patch_size}")
@@ -189,17 +193,21 @@ class TrackTransformer(nn.Module):
     
         text_encoded = self.language_encoder(task_emb)  # (b, c)
         text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
-    
-        x = torch.cat([enc_track, patches, text_encoded], dim=1)
+        print(f"Language token shape: {text_encoded.shape}")
+
+        x = torch.cat([enc_track, patches], dim=1)
+        x = self.film_layer(x, text_encoded)
         print(f"Shape before transformer: {x.shape}")
-        x = self.transformer(x)
+        x = self.transformer(x, language_condition=text_encoded)  # Pass language_condition here
         print(f"Shape after transformer: {x.shape}")
     
         # Extract the CLS token
         cls_token = x[:, 0]
+        print(f"CLS token shape: {cls_token.shape}")
     
         # Get the track representation
         track_rep = x[:, 1:self.num_track_patches+1]
+        print(f"Track representation shape: {track_rep.shape}")
     
         rec_patches = self.img_decoder(x[:, self.num_track_patches+1:-1])
         print(f"rec_patches shape: {rec_patches.shape}")
@@ -358,4 +366,17 @@ class TrackTransformer(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path):
-        self.load_state_dict(torch.load(path, map_location="cpu"))
+        state_dict = torch.load(path, map_location="cpu")
+        model_dict = self.state_dict()
+        
+        # Filter out unnecessary keys
+        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+        
+        # Update model state dict
+        model_dict.update(pretrained_dict)
+        
+        # Load the filtered state dict
+        self.load_state_dict(model_dict, strict=False)
+        
+        print(f"Loaded model from {path}")
+        print(f"Newly initialized layers: {set(model_dict.keys()) - set(pretrained_dict.keys())}")
