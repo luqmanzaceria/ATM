@@ -21,6 +21,7 @@ from atm.utils.train_utils import setup_optimizer, setup_lr_scheduler, init_wand
 from atm.utils.log_utils import MetricLogger, BestAvgLoss
 from atm.utils.env_utils import build_env
 from engine.utils import rollout, merge_results
+from atm.utils.dims_vars_utils import plot_vars, log_dims_and_vars
 
 
 @hydra.main(config_path="../conf/train_bc", version_base="1.3")
@@ -83,6 +84,7 @@ def main(cfg: DictConfig):
             cfg.clip_grad,
             mix_precision=cfg.mix_precision,
             scheduler=scheduler,
+            epoch=epoch,
         )
 
         train_metrics["train/lr"] = optimizer.param_groups[0]["lr"]
@@ -112,6 +114,12 @@ def main(cfg: DictConfig):
                             % (epoch, "loss", best_loss_logger.best_loss)
                         )
                 None if cfg.dry else wandb.log(val_metrics, step=epoch)
+        # Add the plotting function call here
+        if fabric.is_global_zero:
+            if os.path.exists('dims_vars_log.csv'):
+                plot_vars('dims_vars_log.csv', work_dir)
+            else:
+                print("Warning: dims_vars_log.csv not found. Skipping plotting.")
 
         if epoch % cfg.save_freq == 0:
             model.save(f"{work_dir}/model_{epoch}.ckpt")
@@ -158,20 +166,41 @@ def run_one_epoch(fabric,
                   clip_grad=1.0,
                   mix_precision=False,
                   scheduler=None,
-                  ):
+                  epoch=None):
     """
     Optimize the policy. Return a dictionary of the loss and any other metrics.
     """
     tot_loss_dict, tot_items = {}, 0
 
     model.train()
-    i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for step, (obs, track_obs, track, task_emb, action, extra_states) in enumerate(tqdm(dataloader)):
         if mix_precision:
             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
 
+        # Forward pass
+        with torch.no_grad():
+            model_outputs = model(obs, track_obs, track, task_emb, extra_states)
+
+        # Calculate loss
         loss, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
+
+        # Extract relevant information for dims_and_vars
+        # Adjust these based on what your model actually returns
+        cls_token = model_outputs[2] if len(model_outputs) > 2 else None
+        track_rep = model_outputs[3] if len(model_outputs) > 3 else None
+
+        # Modified dims_and_vars block
+        dims_and_vars = {}
+        if cls_token is not None:
+            dims_and_vars["cls_token_dim"] = list(cls_token.shape)  # Directly using shape as a list
+            dims_and_vars["cls_token_var"] = cls_token.var().item()
+        if track_rep is not None:
+            dims_and_vars["track_rep_dim"] = list(track_rep.shape)  # Directly using shape as a list
+            dims_and_vars["track_rep_var"] = track_rep.var().item()
+        dims_and_vars["lang_emb_dim"] = list(task_emb.shape)  # Directly using shape as a list
+        dims_and_vars["lang_emb_var"] = task_emb.var().item()
+
         optimizer.zero_grad()
         fabric.backward(loss)
 
@@ -185,7 +214,8 @@ def run_one_epoch(fabric,
             tot_loss_dict[k] += v
         tot_items += 1
 
-        i += 1
+    # Log dimensions and variances
+    log_dims_and_vars('dims_vars_log.csv', epoch, step, **dims_and_vars)
 
     out_dict = {}
     for k, v in tot_loss_dict.items():
@@ -195,7 +225,6 @@ def run_one_epoch(fabric,
         scheduler.step()
 
     return out_dict
-
 
 @torch.no_grad()
 def evaluate(model, dataloader, mix_precision=False, tag="val"):

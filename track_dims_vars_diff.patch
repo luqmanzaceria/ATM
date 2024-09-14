@@ -1,0 +1,1199 @@
+diff --git a/atm/dataloader/bc_dataloader.py b/atm/dataloader/bc_dataloader.py
+index 19c4bc7..9f4745c 100644
+--- a/atm/dataloader/bc_dataloader.py
++++ b/atm/dataloader/bc_dataloader.py
+@@ -5,6 +5,90 @@ from atm.dataloader.base_dataset import BaseDataset
+ from atm.utils.flow_utils import sample_tracks_nearest_to_grids
+ 
+ 
++class BCDataset(BaseDataset):
++    def __init__(self, track_obs_fs=1, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.track_obs_fs = track_obs_fs
++
++    def __getitem__(self, index):
++        demo_id = self._index_to_demo_id[index]
++        demo_start_index = self._demo_id_to_start_indices[demo_id]
++
++        time_offset = index - demo_start_index
++
++        if self.cache_all:
++            demo = self._cache[demo_id]
++            all_view_frames = []
++            all_view_track_transformer_frames = []
++            for view in self.views:
++                if self.cache_image:
++                    all_view_frames.append(self._load_image_list_from_demo(demo, view, time_offset))  # t c h w
++                    all_view_track_transformer_frames.append(
++                        torch.stack([self._load_image_list_from_demo(demo, view, time_offset + t, num_frames=self.track_obs_fs, backward=True) for t in range(self.frame_stack)])
++                    )  # t tt_fs c h w
++                else:
++                    all_view_frames.append(self._load_image_list_from_disk(demo_id, view, time_offset))  # t c h w
++                    all_view_track_transformer_frames.append(
++                        torch.stack([self._load_image_list_from_disk(demo_id, view, time_offset + t, num_frames=self.track_obs_fs, backward=True) for t in range(self.frame_stack)])
++                    )  # t tt_fs c h w
++        else:
++            demo_pth = self._demo_id_to_path[demo_id]
++            demo = self.process_demo(self.load_h5(demo_pth))
++            all_view_frames = []
++            all_view_track_transformer_frames = []
++            for view in self.views:
++                all_view_frames.append(self._load_image_list_from_demo(demo, view, time_offset))  # t c h w
++                all_view_track_transformer_frames.append(
++                    torch.stack([self._load_image_list_from_demo(demo, view, time_offset + t, num_frames=self.track_obs_fs, backward=True) for t in range(self.frame_stack)])
++                )  # t tt_fs c h w
++
++        all_view_tracks = []
++        all_view_vis = []
++        for view in self.views:
++            all_time_step_tracks = []
++            all_time_step_vis = []
++            for track_start_index in range(time_offset, time_offset+self.frame_stack):
++                all_time_step_tracks.append(demo["root"][view]["tracks"][track_start_index:track_start_index + self.num_track_ts])  # track_len n 2
++                all_time_step_vis.append(demo["root"][view]['vis'][track_start_index:track_start_index + self.num_track_ts])  # track_len n
++            all_view_tracks.append(torch.stack(all_time_step_tracks, dim=0))
++            all_view_vis.append(torch.stack(all_time_step_vis, dim=0))
++
++        obs = torch.stack(all_view_frames, dim=0)  # v t c h w
++        track = torch.stack(all_view_tracks, dim=0)  # v t track_len n 2
++        vi = torch.stack(all_view_vis, dim=0)  # v t track_len n
++        track_transformer_obs = torch.stack(all_view_track_transformer_frames, dim=0)  # v t tt_fs c h w
++
++        # augment rgbs and tracks
++        if np.random.rand() < self.aug_prob:
++            obs, track = self.augmentor((obs / 255., track))
++            obs = obs * 255.
++
++        # sample tracks
++        sample_track, sample_vi = [], []
++        for i in range(len(self.views)):
++            sample_track_per_time, sample_vi_per_time = [], []
++            for t in range(self.frame_stack):
++                track_i_t, vi_i_t = sample_tracks_nearest_to_grids(track[i, t], vi[i, t], num_samples=self.num_track_ids)
++                sample_track_per_time.append(track_i_t)
++                sample_vi_per_time.append(vi_i_t)
++            sample_track.append(torch.stack(sample_track_per_time, dim=0))
++            sample_vi.append(torch.stack(sample_vi_per_time, dim=0))
++        track = torch.stack(sample_track, dim=0)
++        vi = torch.stack(sample_vi, dim=0)
++
++        actions = demo["root"]["actions"][time_offset:time_offset + self.frame_stack]
++        task_embs = demo["root"]["task_emb_bert"]
++        extra_states = {k: v[time_offset:time_offset + self.frame_stack] for k, v in
++                        demo['root']['extra_states'].items()}
++
++        return obs, track_transformer_obs, track, task_embs, actions, extra_states
++import numpy as np
++import torch
++
++from atm.dataloader.base_dataset import BaseDataset
++from atm.utils.flow_utils import sample_tracks_nearest_to_grids
++
++
+ class BCDataset(BaseDataset):
+     def __init__(self, track_obs_fs=1, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+diff --git a/atm/model/track_transformer.py b/atm/model/track_transformer.py
+index e49c765..44556d1 100644
+--- a/atm/model/track_transformer.py
++++ b/atm/model/track_transformer.py
+@@ -225,6 +225,393 @@ class TrackTransformer(nn.Module):
+         vid = self._preprocess_vid(vid)
+         return self.forward(vid, track, task_emb, p_img)
+ 
++    def forward_loss(self,
++                 vid,
++                 track,
++                 task_emb,
++                 lbd_track,
++                 lbd_img,
++                 p_img,
++                 return_outs=False,
++                 vis=None):
++        """
++        track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
++        vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
++        task_emb: (b, e)
++        epoch: current epoch number
++        step: current step number within the epoch
++        """
++
++        if epoch is not None and step is not None:
++            print(f"track_transformer forward_loss: Processing epoch {epoch}, step {step}")
++
++        b, tl, n, _ = track.shape
++        if vis is None:
++            vis = torch.ones((b, tl, n)).to(track.device)
++
++        track = self._preprocess_track(track)
++        vid = self._preprocess_vid(vid)
++        vis = self._preprocess_vis(vis)
++
++        rec_track, rec_patches = self.forward(vid, track, task_emb, p_img)
++        vis[vis == 0] = .1
++        vis = repeat(vis, "b tl n -> b tl n c", c=2)
++
++        track_loss = torch.mean((rec_track - track) ** 2 * vis)
++        img_loss = torch.mean((rec_patches - self._patchify(vid)) ** 2)
++        loss = lbd_track * track_loss + lbd_img * img_loss
++
++        ret_dict = {
++            "loss": loss.item(),
++            "track_loss": track_loss.item(),
++            "img_loss": img_loss.item(),
++        }
++
++        if return_outs:
++            return loss.sum(), ret_dict, (rec_track, rec_patches)
++        return loss.sum(), ret_dict
++
++    def forward_vis(self, vid, track, task_emb, p_img):
++        b = vid.shape[0]
++        assert b == 1, "only support batch size 1 for visualization"
++    
++        H, W = self.img_size
++        _vid = vid.clone()
++        track = self._preprocess_track(track)
++        vid = self._preprocess_vid(vid)
++    
++        rec_track, rec_patches, cls_token, track_rep = self.forward(vid, track, task_emb, p_img)
++    
++        patchified_vid = self._patchify(vid)
++        print(f"rec_patches shape: {rec_patches.shape}")
++        print(f"patchified vid shape: {patchified_vid.shape}")
++        
++        # Ensure the shapes match for loss calculation
++        min_patches = min(rec_patches.shape[1], patchified_vid.shape[1])
++        rec_patches = rec_patches[:, :min_patches, :]
++        patchified_vid = patchified_vid[:, :min_patches, :]
++        
++        track_loss = F.mse_loss(rec_track, track)
++        img_loss = F.mse_loss(rec_patches, patchified_vid)
++        loss = track_loss + img_loss
++    
++        print(f"Before _unpatchify: rec_patches shape = {rec_patches.shape}")
++        rec_image = self._unpatchify(rec_patches)
++        print(f"After _unpatchify: rec_image shape = {rec_image.shape}")
++
++        # place them side by side
++        combined_image = torch.cat([vid[:, -1], rec_image[:, -1]], dim=-1)  # only visualize the current frame
++        combined_image = self.img_unnormalizer(combined_image) * 255
++        combined_image = torch.clamp(combined_image, 0, 255)
++        combined_image = rearrange(combined_image, '1 c h w -> h w c')
++
++        track = track.clone()
++        rec_track = rec_track.clone()
++
++        rec_track_vid = tracks_to_video(rec_track, img_size=H)
++        track_vid = tracks_to_video(track, img_size=H)
++
++        combined_track_vid = torch.cat([track_vid, rec_track_vid], dim=-1)
++
++        _vid = torch.cat([_vid, _vid], dim=-1)
++        combined_track_vid = _vid * .25 + combined_track_vid * .75
++
++        ret_dict = {
++            "loss": loss.sum().item(),
++            "track_loss": track_loss.sum().item(),
++            "img_loss": img_loss.sum().item(),
++            "combined_image": combined_image.cpu().numpy().astype(np.uint8),
++            "combined_track_vid": combined_track_vid.cpu().numpy().astype(np.uint8),
++        }
++
++        return loss.sum(), ret_dict
++
++    def _patchify(self, imgs):
++        """
++        imgs: (N, T, 3, H, W)
++        x: (N, L, patch_size**2 * T * 3)
++        """
++        N, T, C, img_H, img_W = imgs.shape
++        p = self.img_proj_encoder.patch_size[0]
++        assert img_H % p == 0 and img_W % p == 0
++    
++        h = img_H // p
++        w = img_W // p
++        x = imgs.reshape(shape=(N, T, C, h, p, w, p))
++        x = rearrange(x, "n t c h p w q -> n (h w) (p q t c)")
++        return x
++
++    def _unpatchify(self, x):
++        """
++        x: (N, L, patch_size**2 * T * 3)
++        imgs: (N, T, 3, H, W)
++        """
++        p = self.img_proj_encoder.patch_size[0]
++        h = self.img_size[0] // p
++        w = self.img_size[1] // p
++        
++        print(f"_unpatchify: x.shape = {x.shape}")
++        print(f"_unpatchify: Expected patches = {h * w}, Actual patches = {x.shape[1]}")
++        
++        if h * w != x.shape[1]:
++            print(f"Warning: Number of patches mismatch. Expected {h * w}, got {x.shape[1]}. Adjusting...")
++            # Pad or trim x to match the expected number of patches
++            if h * w > x.shape[1]:
++                pad_size = h * w - x.shape[1]
++                x = F.pad(x, (0, 0, 0, pad_size))
++            else:
++                x = x[:, :h*w, :]
++    
++        x = rearrange(x, "n (h w) (p q t c) -> n h w p q t c", h=h, w=w, p=p, q=p, t=self.frame_stack, c=3)
++        x = rearrange(x, "n h w p q t c -> n t c h p w q")
++        imgs = rearrange(x, "n t c h p w q -> n t c (h p) (w q)")
++        return imgs
++
++    def save(self, path):
++        torch.save(self.state_dict(), path)
++
++    def load(self, path):
++        state_dict = torch.load(path, map_location="cpu")
++        model_dict = self.state_dict()
++        
++        # Filter out unnecessary keys
++        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict}
++        
++        # Update model state dict
++        model_dict.update(pretrained_dict)
++        
++        # Load the filtered state dict
++        self.load_state_dict(model_dict, strict=False)
++        
++        print(f"Loaded model from {path}")
++        print(f"Newly initialized layers: {set(model_dict.keys()) - set(pretrained_dict.keys())}")
++import numpy as np
++import torch
++import torch.nn.functional as F
++import torchvision.transforms as T
++from einops import rearrange, repeat
++from timm.models.vision_transformer import PatchEmbed
++from torch import nn
++
++from atm.utils.flow_utils import ImageUnNormalize, tracks_to_video
++from atm.utils.pos_embed_utils import get_1d_sincos_pos_embed, get_2d_sincos_pos_embed
++from atm.policy.vilt_modules.language_modules import *
++from .track_patch_embed import TrackPatchEmbed
++from .transformer import Transformer
++
++from atm.model.film import FiLMLayer
++
++class TrackTransformer(nn.Module):
++    """
++    flow video model using a BERT transformer
++
++    dim: int, dimension of the model
++    depth: int, number of layers
++    heads: int, number of heads
++    dim_head: int, dimension of each head
++    attn_dropout: float, dropout for attention layers
++    ff_dropout: float, dropout for feedforward layers
++    """
++
++    def __init__(self,
++                 transformer_cfg,
++                 track_cfg,
++                 vid_cfg,
++                 language_encoder_cfg,
++                 load_path=None):
++        super().__init__()
++        self.dim = dim = transformer_cfg.dim
++        self.transformer = self._init_transformer(**transformer_cfg)
++        self.track_proj_encoder, self.track_decoder = self._init_track_modules(**track_cfg, dim=dim)
++        self.img_proj_encoder, self.img_decoder = self._init_video_modules(**vid_cfg, dim=dim)
++        self.language_encoder = self._init_language_encoder(output_size=dim, **language_encoder_cfg)
++        self._init_weights(self.dim, self.num_img_patches)
++
++        self.film_layer = FiLMLayer(dim, dim)
++
++        print(f"TrackTransformer: Image size: {self.img_size}")
++        print(f"TrackTransformer: Patch size: {self.img_proj_encoder.patch_size}")
++        print(f"TrackTransformer: Number of patches: {self.num_img_patches}")
++        print(f"TrackTransformer: Transformer dim: {self.dim}")
++        print(f"TrackTransformer: Number of track patches: {self.num_track_patches}")
++
++        if load_path is not None:
++            self.load(load_path)
++            print(f"loaded model from {load_path}")
++            
++    def _init_transformer(self, dim, dim_head, heads, depth, attn_dropout, ff_dropout):
++        self.transformer = Transformer(
++            dim=dim,
++            dim_head=dim_head,
++            heads=heads,
++            depth=depth,
++            attn_dropout=attn_dropout,
++            ff_dropout=ff_dropout)
++
++        return self.transformer
++
++    def _init_track_modules(self, dim, num_track_ts, num_track_ids, patch_size=1):
++        self.num_track_ts = num_track_ts
++        self.num_track_ids = num_track_ids
++        self.track_patch_size = patch_size
++
++        self.track_proj_encoder = TrackPatchEmbed(
++            num_track_ts=num_track_ts,
++            num_track_ids=num_track_ids,
++            patch_size=patch_size,
++            in_dim=2,
++            embed_dim=dim)
++        self.num_track_patches = self.track_proj_encoder.num_patches
++        self.track_decoder = nn.Linear(dim, 2 * patch_size, bias=True)
++        self.num_track_ids = num_track_ids
++        self.num_track_ts = num_track_ts
++
++        return self.track_proj_encoder, self.track_decoder
++
++    def _init_video_modules(self, dim, img_size, patch_size, frame_stack=1, img_mean=[.5, .5, .5], img_std=[.5, .5, .5]):
++        self.img_normalizer = T.Normalize(img_mean, img_std)
++        self.img_unnormalizer = ImageUnNormalize(img_mean, img_std)
++        if isinstance(img_size, int):
++            img_size = (img_size, img_size)
++        else:
++            img_size = (img_size[0], img_size[1])
++        self.img_size = img_size
++        self.frame_stack = frame_stack
++        self.patch_size = patch_size
++        self.img_proj_encoder = PatchEmbed(
++            img_size=img_size,
++            patch_size=patch_size,
++            in_chans=3 * self.frame_stack,
++            embed_dim=dim,
++        )
++        self.num_img_patches = self.img_proj_encoder.num_patches
++        self.img_decoder = nn.Linear(dim, 3 * self.frame_stack * patch_size ** 2, bias=True)
++
++        return self.img_proj_encoder, self.img_decoder
++
++    def _init_language_encoder(self, network_name, **language_encoder_kwargs):
++        return eval(network_name)(**language_encoder_kwargs)
++
++    def _init_weights(self, dim, num_img_patches):
++        """
++        initialize weights; freeze all positional embeddings
++        """
++        num_track_t = self.num_track_ts // self.track_patch_size
++
++        self.track_embed = nn.Parameter(torch.randn(1, num_track_t, 1, dim), requires_grad=True)
++        self.img_embed = nn.Parameter(torch.randn(1, num_img_patches, dim), requires_grad=False)
++        self.mask_token = nn.Parameter(torch.randn(1, 1, dim))
++
++        track_embed = get_1d_sincos_pos_embed(dim, num_track_t)
++        track_embed = rearrange(track_embed, 't d -> () t () d')
++        self.track_embed.data.copy_(torch.from_numpy(track_embed))
++
++        num_patches_h, num_patches_w = self.img_size[0] // self.patch_size, self.img_size[1] // self.patch_size
++        img_embed = get_2d_sincos_pos_embed(dim, (num_patches_h, num_patches_w))
++        img_embed = rearrange(img_embed, 'n d -> () n d')
++        self.img_embed.data.copy_(torch.from_numpy(img_embed))
++
++        print(f"num_track_patches: {self.num_track_patches}, num_img_patches: {num_img_patches}, total: {self.num_track_patches + num_img_patches}")
++
++    def _preprocess_track(self, track):
++        return track
++
++    def _preprocess_vis(self, vis):
++        return vis
++
++    def _preprocess_vid(self, vid):
++        assert torch.max(vid) >= 2
++
++        vid = vid[:, -self.frame_stack:]
++        vid = self.img_normalizer(vid / 255.)
++        return vid
++
++    def _encode_track(self, track):
++        """
++        track: (b, t, n, 2)
++        """
++        b, t, n, _ = track.shape
++        track = self._mask_track_as_first(track)  # b, t, n, d. track embedding is 1, t, 1, d
++        track = self.track_proj_encoder(track)
++
++        track = track + self.track_embed
++        track = rearrange(track, 'b t n d -> b (t n) d')
++        return track
++
++    def _encode_video(self, vid, p):
++        """
++        vid: (b, t, c, h, w)
++        """
++        vid = rearrange(vid, "b t c h w -> b (t c) h w")
++        patches = self.img_proj_encoder(vid)  # b, n, d
++        patches = self._mask_patches(patches, p=p)
++        patches = patches + self.img_embed
++
++        return patches
++
++    def _mask_patches(self, patches, p):
++        """
++        mask patches according to p
++        """
++        b, n, _ = patches.shape
++        mask = torch.rand(b, n, device=patches.device) < p
++        masked_patches = patches.clone()
++        masked_patches[mask] = self.mask_token
++        return masked_patches
++
++    def _mask_track_as_first(self, track):
++        """
++        mask out all frames to have the same token as the first frame
++        """
++        mask_track = track.clone() # b, t, n, d
++        mask_track[:, 1:] = track[:, [0]]
++        return mask_track
++
++    def forward(self, vid, track, task_emb, p_img):
++        assert torch.max(vid) <= 1.
++        B, T, C, H, W = vid.shape
++        patches = self._encode_video(vid, p_img)  # (b, n_image, d)
++        
++        if track is None:
++            # Create a dummy track if track is None
++            track = torch.zeros((B, self.num_track_ts, self.num_track_ids, 2), device=vid.device)
++        
++        enc_track = self._encode_track(track)
++    
++        text_encoded = self.language_encoder(task_emb)  # (b, c)
++        text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
++        print(f"Language token shape: {text_encoded.shape}")
++
++        x = torch.cat([enc_track, patches], dim=1)
++        x = self.film_layer(x, text_encoded)
++        print(f"Shape before transformer: {x.shape}")
++        x = self.transformer(x, language_condition=text_encoded)  # Pass language_condition here
++        print(f"Shape after transformer: {x.shape}")
++    
++        # Extract the CLS token
++        cls_token = x[:, 0]
++        print(f"CLS token shape: {cls_token.shape}")
++    
++        # Get the track representation
++        track_rep = x[:, 1:self.num_track_patches+1]
++        print(f"Track representation shape: {track_rep.shape}")
++    
++        rec_patches = self.img_decoder(x[:, self.num_track_patches+1:-1])
++        print(f"rec_patches shape: {rec_patches.shape}")
++        print(f"patches shape: {patches.shape}")
++    
++        num_track_h = self.num_track_ts // self.track_patch_size
++        rec_track = self.track_decoder(track_rep)
++        rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
++    
++        return rec_track, rec_patches, cls_token, track_rep
++
++    def reconstruct(self, vid, track, task_emb, p_img):
++        assert len(vid.shape) == 5  # b, t, c, h, w
++        track = self._preprocess_track(track)
++        vid = self._preprocess_vid(vid)
++        return self.forward(vid, track, task_emb, p_img)
++
+     def forward_loss(self,
+                      vid,
+                      track,
+diff --git a/atm/policy/vilt.py b/atm/policy/vilt.py
+index 0cf459a..6fc1555 100644
+--- a/atm/policy/vilt.py
++++ b/atm/policy/vilt.py
+@@ -17,6 +17,596 @@ from atm.policy.vilt_modules.extra_state_modules import ExtraModalityTokens
+ from atm.policy.vilt_modules.policy_head import *
+ from atm.utils.flow_utils import ImageUnNormalize, sample_double_grid, tracks_to_video
+ 
++from atm.model.track_transformer import FiLMLayer
++from atm.utils.dims_vars_utils import log_dims_and_vars
++
++###############################################################################
++#
++# A ViLT Policy
++#
++###############################################################################
++
++
++
++
++
++class BCViLTPolicy(nn.Module):
++    """
++    Input: (o_{t-H}, ... , o_t)
++    Output: a_t or distribution of a_t
++    """
++
++    def __init__(self, obs_cfg, img_encoder_cfg, language_encoder_cfg, extra_state_encoder_cfg, track_cfg,
++                 spatial_transformer_cfg, temporal_transformer_cfg,
++                 policy_head_cfg, load_path=None):
++        super().__init__()
++
++        self._process_obs_shapes(**obs_cfg)
++
++        # 1. encode image
++        self._setup_image_encoder(**img_encoder_cfg)
++
++        # 2. encode language (spatial)
++        self.language_encoder_spatial = self._setup_language_encoder(output_size=self.spatial_embed_size, **language_encoder_cfg)
++
++        # 3. Track Transformer module
++        self._setup_track(**track_cfg)
++
++        # 3. define spatial positional embeddings, modality embeddings, and spatial token for summary
++        self._setup_spatial_positional_embeddings()
++
++        # 4. define spatial transformer
++        self._setup_spatial_transformer(**spatial_transformer_cfg)
++
++        # 5. encode extra information (e.g. gripper, joint_state)
++        self.extra_encoder = self._setup_extra_state_encoder(extra_embedding_size=self.temporal_embed_size, **extra_state_encoder_cfg)
++
++        # 6. encode language (temporal), this will also act as the TEMPORAL_TOKEN, i.e., CLS token for action prediction
++        self.language_encoder_temporal = self._setup_language_encoder(output_size=self.temporal_embed_size, **language_encoder_cfg)
++
++        # 7. define temporal transformer
++        self._setup_temporal_transformer(**temporal_transformer_cfg)
++
++        # 8. define policy head
++        self._setup_policy_head(**policy_head_cfg)
++
++        self.track_proj1 = nn.Linear(49536, self.spatial_embed_size)  # Adjust input size as needed
++        self.track_proj2 = nn.Linear(256, self.spatial_embed_size)
++
++        self.film_layer = FiLMLayer(self.spatial_embed_size, self.spatial_embed_size)
++        self.language_proj_spatial = nn.Linear(self.spatial_embed_size * 2, self.spatial_embed_size)
++    
++        if load_path is not None:
++            self.load(load_path)
++            self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
++
++    def _process_obs_shapes(self, obs_shapes, num_views, extra_states, img_mean, img_std, max_seq_len):
++        self.img_normalizer = T.Normalize(img_mean, img_std)
++        self.img_unnormalizer = ImageUnNormalize(img_mean, img_std)
++        self.obs_shapes = obs_shapes
++        self.policy_num_track_ts = obs_shapes["tracks"][0]
++        self.policy_num_track_ids = obs_shapes["tracks"][1]
++        self.num_views = num_views
++        self.extra_state_keys = extra_states
++        self.max_seq_len = max_seq_len
++        # define buffer queue for encoded latent features
++        self.latent_queue = deque(maxlen=max_seq_len)
++        self.track_obs_queue = deque(maxlen=max_seq_len)
++
++    def _setup_image_encoder(self, network_name, patch_size, embed_size, no_patch_embed_bias):
++        self.spatial_embed_size = embed_size
++        self.image_encoders = []
++        for _ in range(self.num_views):
++            input_shape = self.obs_shapes["rgb"]
++            self.image_encoders.append(eval(network_name)(input_shape=input_shape, patch_size=patch_size,
++                                                          embed_size=self.spatial_embed_size,
++                                                          no_patch_embed_bias=no_patch_embed_bias))
++        self.image_encoders = nn.ModuleList(self.image_encoders)
++
++        self.img_num_patches = sum([x.num_patches for x in self.image_encoders])
++
++    def _setup_language_encoder(self, network_name, **language_encoder_kwargs):
++        language_output_size = self.spatial_embed_size * 2  # Double the size
++        
++        # Remove 'output_size' from kwargs if it exists
++        language_encoder_kwargs.pop('output_size', None)
++        
++        # Now pass output_size explicitly
++        return eval(network_name)(output_size=language_output_size, **language_encoder_kwargs)
++
++    def _setup_track(self, track_fn, policy_track_patch_size=None, use_zero_track=False):
++        """
++        track_fn: path to the track model
++        policy_track_patch_size: The patch size of TrackPatchEmbedding in the policy, if None, it will be assigned the same patch size as TrackTransformer by default
++        use_zero_track: whether to zero out the tracks (ie use only the image)
++        """
++        track_cfg = OmegaConf.load(f"{track_fn}/config.yaml")
++        self.use_zero_track = use_zero_track
++
++        track_cfg.model_cfg.load_path = f"{track_fn}/model_best.ckpt"
++        track_cls = eval(track_cfg.model_name)
++        self.track = track_cls(**track_cfg.model_cfg)
++        # freeze
++        self.track.eval()
++        for param in self.track.parameters():
++            param.requires_grad = False
++
++        self.num_track_ids = self.track.num_track_ids
++        self.num_track_ts = self.track.num_track_ts
++        self.policy_track_patch_size = self.track.track_patch_size if policy_track_patch_size is None else policy_track_patch_size
++
++
++        self.track_proj_encoder = TrackPatchEmbed(
++            num_track_ts=self.policy_num_track_ts,
++            num_track_ids=self.num_track_ids,
++            patch_size=self.policy_track_patch_size,
++            in_dim=2 + self.num_views,  # X, Y, one-hot view embedding
++            embed_dim=self.spatial_embed_size)
++
++        self.track_id_embed_dim = 16
++        self.num_track_patches_per_view = self.track_proj_encoder.num_patches_per_track
++        self.num_track_patches = self.num_track_patches_per_view * self.num_views
++
++    def _setup_spatial_positional_embeddings(self):
++        # setup positional embeddings
++        spatial_token = nn.Parameter(torch.randn(1, 1, self.spatial_embed_size))  # SPATIAL_TOKEN
++        img_patch_pos_embed = nn.Parameter(torch.randn(1, self.img_num_patches, self.spatial_embed_size))
++        track_pos_embed = nn.Parameter(torch.randn(1, 1, 1, self.spatial_embed_size))  # for track embedding
++        modality_embed = nn.Parameter(
++            torch.randn(1, len(self.image_encoders) + 1 + 1, self.spatial_embed_size)
++        )  # IMG_PATCH_TOKENS + TRACK_TOKEN + SENTENCE_TOKEN
++    
++        self.register_parameter("spatial_token", spatial_token)
++        self.register_parameter("img_patch_pos_embed", img_patch_pos_embed)
++        self.register_parameter("track_pos_embed", track_pos_embed)
++        self.register_parameter("modality_embed", modality_embed)
++    
++        # for selecting modality embed
++        modality_idx = []
++        for i, encoder in enumerate(self.image_encoders):
++            modality_idx += [i] * encoder.num_patches
++        modality_idx += [len(self.image_encoders)]  # for track embedding
++        modality_idx += [len(self.image_encoders) + 1]  # for sentence embedding
++        self.modality_idx = torch.LongTensor(modality_idx)
++    
++        print(f"spatial_token shape: {spatial_token.shape}")
++        print(f"img_patch_pos_embed shape: {img_patch_pos_embed.shape}")
++        print(f"track_pos_embed shape: {track_pos_embed.shape}")
++        print(f"modality_embed shape: {modality_embed.shape}")
++        print(f"modality_idx shape: {self.modality_idx.shape}")
++
++    def _setup_extra_state_encoder(self, **extra_state_encoder_cfg):
++        if len(self.extra_state_keys) == 0:
++            return None
++        else:
++            return ExtraModalityTokens(
++                use_joint=("joint_states" in self.extra_state_keys),
++                use_gripper=("gripper_states" in self.extra_state_keys),
++                use_ee=("ee_states" in self.extra_state_keys),
++                **extra_state_encoder_cfg
++            )
++
++    def _setup_spatial_transformer(self, num_layers, num_heads, head_output_size, mlp_hidden_size, dropout,
++                                   spatial_downsample, spatial_downsample_embed_size, use_language_token=True):
++        self.spatial_transformer = TransformerDecoder(
++            input_size=self.spatial_embed_size,
++            num_layers=num_layers,
++            num_heads=num_heads,
++            head_output_size=head_output_size,
++            mlp_hidden_size=mlp_hidden_size,
++            dropout=dropout,
++        )
++
++        if spatial_downsample:
++            self.temporal_embed_size = spatial_downsample_embed_size
++            self.spatial_downsample = nn.Linear(self.spatial_embed_size, self.temporal_embed_size)
++        else:
++            self.temporal_embed_size = self.spatial_embed_size
++            self.spatial_downsample = nn.Identity()
++
++        self.spatial_transformer_use_text = use_language_token
++
++    def _setup_temporal_transformer(self, num_layers, num_heads, head_output_size, mlp_hidden_size, dropout, use_language_token=True):
++        self.temporal_position_encoding_fn = SinusoidalPositionEncoding(input_size=self.temporal_embed_size)
++
++        self.temporal_transformer = TransformerDecoder(
++            input_size=self.temporal_embed_size,
++            num_layers=num_layers,
++            num_heads=num_heads,
++            head_output_size=head_output_size,
++            mlp_hidden_size=mlp_hidden_size,
++            dropout=dropout,)
++        self.temporal_transformer_use_text = use_language_token
++
++        action_cls_token = nn.Parameter(torch.zeros(1, 1, self.temporal_embed_size))
++        nn.init.normal_(action_cls_token, std=1e-6)
++        self.register_parameter("action_cls_token", action_cls_token)
++
++    def _setup_policy_head(self, network_name, **policy_head_kwargs):
++        policy_head_kwargs["input_size"] = self.temporal_embed_size
++        print(f"Policy head input size: {policy_head_kwargs['input_size']}")
++    
++        action_shape = policy_head_kwargs["output_size"]
++        self.act_shape = action_shape
++        self.out_shape = np.prod(action_shape)
++        policy_head_kwargs["output_size"] = self.out_shape
++        self.policy_head = eval(network_name)(**policy_head_kwargs)
++
++    @torch.no_grad()
++    def preprocess(self, obs, track, action):
++        """
++        Preprocess observations, according to an observation dictionary.
++        Return the feature and state.
++        """
++        b, v, t, c, h, w = obs.shape
++
++        action = action.reshape(b, t, self.out_shape)
++
++        obs = self._preprocess_rgb(obs)
++
++        return obs, track, action
++
++    @torch.no_grad()
++    def _preprocess_rgb(self, rgb):
++        rgb = self.img_normalizer(rgb / 255.)
++        return rgb
++
++    def _get_view_one_hot(self, tr):
++        """ tr: b, v, t, tl, n, d -> (b, v, t), tl n, d + v"""
++        b, v, t, tl, n, d = tr.shape
++        tr = rearrange(tr, "b v t tl n d -> (b t tl n) v d")
++        one_hot = torch.eye(v, device=tr.device, dtype=tr.dtype)[None, :, :].repeat(tr.shape[0], 1, 1)
++        tr_view = torch.cat([tr, one_hot], dim=-1)  # (b t tl n) v (d + v)
++        tr_view = rearrange(tr_view, "(b t tl n) v c -> b v t tl n c", b=b, v=v, t=t, tl=tl, n=n, c=d + v)
++        return tr_view
++
++    def _encode_track(self, track_obs, task_emb, epoch=None, step=None):
++        """
++        track_obs: b v t tt_fs c h w
++        task_emb: b e
++        Returns: b v t d
++        """
++        b, v, t, tt_fs, c, h, w = track_obs.shape
++        track_obs = rearrange(track_obs, 'b v t tt_fs c h w -> (b v t) tt_fs c h w')
++        
++        # Normalize the track_obs
++        track_obs = track_obs / 255.0  # Assuming the input is in the range [0, 255]
++        track_obs = self.img_normalizer(track_obs)
++        
++        expand_task_emb = repeat(task_emb, 'b e -> (b v t) e', v=v, t=t)
++        
++        # Create a dummy track of the correct shape
++        dummy_track = torch.zeros((b*v*t, self.track.num_track_ts, self.track.num_track_ids, 2), device=track_obs.device)
++        
++        with torch.no_grad():
++            _, _, cls_token, track_rep = self.track(track_obs, dummy_track, expand_task_emb, p_img=0)
++        
++        cls_token = rearrange(cls_token, '(b v t) d -> b v t d', b=b, v=v, t=t)
++        track_rep = rearrange(track_rep, '(b v t) n d -> b v t (n d)', b=b, v=v, t=t)
++        
++        # Concatenate cls_token and track_rep
++        track_encoded = torch.cat([cls_token, track_rep], dim=-1)
++        
++        print(f"track_encoded shape after _encode_track: {track_encoded.shape}")
++
++        # Log dimensions and variances
++        log_dims_and_vars('dims_vars_log.csv', epoch, step,
++                      cls_token_dim=cls_token.shape[-1],
++                      track_rep_dim=track_rep.shape[-1],
++                      track_encoded_dim=track_encoded.shape[-1],
++                      lang_emb_dim=task_emb.shape[-1],
++                      cls_token_var=cls_token.var().item(),
++                      track_rep_var=track_rep.var().item(),
++                      track_encoded_var=track_encoded.var().item(),
++                      lang_emb_var=task_emb.var().item())
++        
++        return track_encoded
++
++    def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False):
++        # 1. encode image
++        img_encoded = []
++        for view_idx in range(self.num_views):
++            img_encoded.append(
++                rearrange(
++                    TensorUtils.time_distributed(
++                        obs[:, view_idx, ...], self.image_encoders[view_idx]
++                    ),
++                    "b t c h w -> b t (h w) c",
++                )
++            )  # (b, t, num_patches, c)
++    
++        img_encoded = torch.cat(img_encoded, -2)  # (b, t, 2*num_patches, c)
++        img_encoded += self.img_patch_pos_embed.unsqueeze(0)  # (b, t, 2*num_patches, c)
++        B, T = img_encoded.shape[:2]
++    
++        # 2. encode task_emb
++        text_encoded = self.language_encoder_spatial(task_emb)  # (b, c*2)
++        text_encoded = self.language_proj_spatial(text_encoded)  # (b, c)
++        log_dims_and_vars('dims_vars_log.csv', epoch, step,
++                      spatial_lang_emb_dim=text_encoded.shape[-1],
++                      spatial_lang_emb_var=text_encoded.var().item())
++        text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
++    
++        # 3. encode track
++        track_encoded = self._encode_track(track_obs, task_emb)  # track_encoded: (b, v, t, cls_dim + track_rep_dim)
++        print(f"track_encoded shape: {track_encoded.shape}")
++        
++        track_encoded = rearrange(track_encoded, 'b v t c -> (b t) v c')
++        print(f"track_encoded shape after rearrange: {track_encoded.shape}")
++        
++        # Project track_encoded to match the embedding size
++        track_encoded = self.track_proj1(track_encoded)
++        print(f"track_encoded shape after projection: {track_encoded.shape}")
++        
++        # Reshape back to (b, t, v, c)
++        track_encoded = rearrange(track_encoded, '(b t) v c -> b t v c', b=B, t=T)
++        
++        # Adjust track_pos_embed to match the dimensions of track_encoded
++        track_pos_embed = self.track_pos_embed.expand(B, T, self.num_views, -1)
++        print(f"track_pos_embed shape: {track_pos_embed.shape}")
++        
++        track_encoded += track_pos_embed  # (b, t, v, c)
++        
++        # Flatten the view dimension
++        track_encoded = rearrange(track_encoded, 'b t v c -> b t (v c)')
++        track_encoded = self.track_proj2(track_encoded)
++        print(f"final track_encoded shape: {track_encoded.shape}")
++        
++        # Concatenate image and track embeddings
++        img_track_encoded = torch.cat([img_encoded, track_encoded.unsqueeze(2)], -2)  # (b, t, num_img_patch + 1, c)
++        
++        # Expand text_encoded to match the time dimension of img_track_encoded
++        text_encoded_expanded = text_encoded.expand(-1, img_track_encoded.shape[1], -1, -1)
++        
++        # Apply FiLM layer
++        img_track_encoded = self.film_layer(img_track_encoded, text_encoded_expanded)
++        
++        # 3. concat img + track + text embs then add modality embeddings
++        if self.spatial_transformer_use_text:
++            img_track_text_encoded = torch.cat([img_track_encoded, text_encoded], -2)  # (b, t, num_img_patch + 1 + 1, c)
++            img_track_text_encoded += self.modality_embed[None, :, self.modality_idx, :]
++        else:
++            img_track_text_encoded = img_track_encoded  # (b, t, num_img_patch + 1, c)
++            img_track_text_encoded += self.modality_embed[None, :, self.modality_idx[:-1], :]
++        
++        print(f"img_track_text_encoded shape: {img_track_text_encoded.shape}")
++    
++        # 4. add spatial token
++        spatial_token = self.spatial_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c)
++        encoded = torch.cat([spatial_token, img_track_text_encoded], -2)  # (b, t, 1 + 2*num_img_patch + 1 + 1, c)
++    
++        # 5. pass through transformer
++        encoded = rearrange(encoded, "b t n c -> (b t) n c")  # (b*t, 1 + 2*num_img_patch + v + 1, c)
++        out = self.spatial_transformer(encoded)
++        out = out[:, 0]  # extract spatial token as summary at o_t
++        out = self.spatial_downsample(out).view(B, T, 1, -1)  # (b, t, 1, c')
++    
++        # 6. encode extra states
++        if self.extra_encoder is None:
++            extra = None
++        else:
++            extra = self.extra_encoder(extra_states)  # (B, T, num_extra, c')
++    
++        # 7. encode language, treat it as action token
++        text_encoded_ = self.language_encoder_temporal(task_emb)  # (b, c')
++        text_encoded_ = text_encoded_.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c')
++        action_cls_token = self.action_cls_token.unsqueeze(0).expand(B, T, -1, -1)  # (b, t, 1, c')
++        if self.temporal_transformer_use_text:
++            out_seq = [action_cls_token, text_encoded_, out]
++        else:
++            out_seq = [action_cls_token, out]
++    
++        if self.extra_encoder is not None:
++            out_seq.append(extra)
++        output = torch.cat(out_seq, -2)  # (b, t, 2 or 3 + num_extra, c')
++    
++        if return_recon:
++            output = (output, None)  # We're not using reconstructed tracks anymore
++    
++        return output
++
++    def temporal_encode(self, x):
++        """
++        Args:
++            x: b, t, num_modality, c
++        Returns:
++        """
++        pos_emb = self.temporal_position_encoding_fn(x)  # (t, c)
++        x = x + pos_emb.unsqueeze(1)  # (b, t, 2+num_extra, c)
++        sh = x.shape
++        self.temporal_transformer.compute_mask(x.shape)
++
++        x = TensorUtils.join_dimensions(x, 1, 2)  # (b, t*num_modality, c)
++        x = self.temporal_transformer(x)
++        x = x.reshape(*sh)  # (b, t, num_modality, c)
++        return x[:, :, 0]  # (b, t, c)
++
++    def forward(self, obs, track_obs, track, task_emb, extra_states, epoch=None, step=None):
++        """
++        Return feature and info.
++        Args:
++            obs: b v t c h w
++            track_obs: b v t tt_fs c h w
++            track: not used
++            extra_states: {k: b t e}
++            epoch: current epoch number (optional)
++            step: current step number within the epoch (optional)
++        """
++        x = self.spatial_encode(obs, track_obs, task_emb, extra_states, epoch=epoch, step=step)  # x: (b, t, 2+num_extra, c)
++        x = self.temporal_encode(x)  # (b, t, c)
++        print(f"Shape of x before policy head: {x.shape}")
++        dist = self.policy_head(x)  # only use the current timestep feature to predict action
++
++        # Calculate dimensions and variances
++        dims_and_vars = {
++            "cls_token_dim": x.shape[-1],  # Assuming x is the CLS token
++            "track_rep_dim": track_rep.shape[-1] if 'track_rep' in locals() else 0,
++            "lang_emb_dim": task_emb.shape[-1],
++            "cls_token_var": x.var().item(),
++            "track_rep_var": track_rep.var().item() if 'track_rep' in locals() else 0,
++            "lang_emb_var": task_emb.var().item(),
++        }
++
++        return dist, dims_and_vars
++        
++    def forward_loss(self, obs, track_obs, track, task_emb, extra_states, action, epoch=None, step=None):
++        """
++        Args:
++            obs: b v t c h w
++            track_obs: b v t tt_fs c h w
++            track: b v t track_len n 2, not used for training, only preserved for unified interface
++            task_emb: b emb_size
++            action: b t act_dim
++            epoch: current epoch number (optional)
++            step: current step number within the epoch (optional)
++        """
++        obs, track, action = self.preprocess(obs, track, action)
++        dist, dims_and_vars = self.forward(obs, track_obs, track, task_emb, extra_states, epoch=epoch, step=step)
++        loss = self.policy_head.loss_fn(dist, action, reduction="mean")
++    
++        ret_dict = {
++            "loss": loss.sum().item(),
++        }
++
++    
++        if not self.policy_head.deterministic:
++            # pseudo loss
++            sampled_action = dist.sample().detach()
++            mse_loss = F.mse_loss(sampled_action, action)
++            ret_dict["pseudo_sampled_action_mse_loss"] = mse_loss.sum().item()
++    
++        ret_dict["loss"] = ret_dict["bc_loss"]
++        return loss.sum(), ret_dict, dims_and_vars
++
++    def forward_vis(self, obs, track_obs, track, task_emb, extra_states, action):
++        """
++        Args:
++            obs: b v t c h w
++            track_obs: b v t tt_fs c h w
++            track: b v t track_len n 2
++            task_emb: b emb_size
++        Returns:
++        """
++        _, track, _ = self.preprocess(obs, track, action)
++        track = track[:, :, 0, :, :, :]  # (b, v, track_len, n, 2) use the track in the first timestep
++
++        b, v, t, track_obs_t, c, h, w = track_obs.shape
++        if t >= self.num_track_ts:
++            track_obs = track_obs[:, :, :self.num_track_ts, ...]
++            track = track[:, :, :self.num_track_ts, ...]
++        else:
++            last_obs = track_obs[:, :, -1:, ...]
++            pad_obs = repeat(last_obs, "b v 1 track_obs_t c h w -> b v t track_obs_t c h w", t=self.num_track_ts-t)
++            track_obs = torch.cat([track_obs, pad_obs], dim=2)
++            last_track = track[:, :, -1:, ...]
++            pad_track = repeat(last_track, "b v 1 n d -> b v tl n d", tl=self.num_track_ts-t)
++            track = torch.cat([track, pad_track], dim=2)
++
++        grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
++        grid_track = repeat(grid_points, "n d -> b v tl n d", b=b, v=v, tl=self.num_track_ts)
++
++        all_ret_dict = {}
++        for view in range(self.num_views):
++            gt_track = track[:1, view]  # (1 tl n d)
++            gt_track_vid = tracks_to_video(gt_track, img_size=h)
++            combined_gt_track_vid = (track_obs[:1, view, 0, :, ...] * .25 + gt_track_vid * .75).cpu().numpy().astype(np.uint8)
++
++            _, ret_dict = self.track.forward_vis(track_obs[:1, view, 0, :, ...], grid_track[:1, view], task_emb[:1], p_img=0)
++            ret_dict["combined_track_vid"] = np.concatenate([combined_gt_track_vid, ret_dict["combined_track_vid"]], axis=-1)
++
++            all_ret_dict = {k: all_ret_dict.get(k, []) + [v] for k, v in ret_dict.items()}
++
++        for k, v in all_ret_dict.items():
++            if k == "combined_image" or k == "combined_track_vid":
++                all_ret_dict[k] = np.concatenate(v, axis=-2)  # concat on the height dimension
++            else:
++                all_ret_dict[k] = np.mean(v)
++        return None, all_ret_dict
++
++    def act(self, obs, task_emb, extra_states):
++        """
++        Args:
++            obs: (b, v, h, w, c)
++            task_emb: (b, em_dim)
++            extra_states: {k: (b, state_dim,)}
++        """
++        self.eval()
++        B = obs.shape[0]
++
++        # expand time dimenstion
++        obs = rearrange(obs, "b v h w c -> b v 1 c h w").copy()
++        extra_states = {k: rearrange(v, "b e -> b 1 e") for k, v in extra_states.items()}
++
++        dtype = next(self.parameters()).dtype
++        device = next(self.parameters()).device
++        obs = torch.Tensor(obs).to(device=device, dtype=dtype)
++        task_emb = torch.Tensor(task_emb).to(device=device, dtype=dtype)
++        extra_states = {k: torch.Tensor(v).to(device=device, dtype=dtype) for k, v in extra_states.items()}
++
++        if (obs.shape[-2] != self.obs_shapes["rgb"][-2]) or (obs.shape[-1] != self.obs_shapes["rgb"][-1]):
++            obs = rearrange(obs, "b v fs c h w -> (b v fs) c h w")
++            obs = F.interpolate(obs, size=self.obs_shapes["rgb"][-2:], mode="bilinear", align_corners=False)
++            obs = rearrange(obs, "(b v fs) c h w -> b v fs c h w", b=B, v=self.num_views)
++
++        while len(self.track_obs_queue) < self.max_seq_len:
++            self.track_obs_queue.append(torch.zeros_like(obs))
++        self.track_obs_queue.append(obs.clone())
++        track_obs = torch.cat(list(self.track_obs_queue), dim=2)  # b v fs c h w
++        track_obs = rearrange(track_obs, "b v fs c h w -> b v 1 fs c h w")
++
++        obs = self._preprocess_rgb(obs)
++
++        with torch.no_grad():
++            x, rec_tracks = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True)  # x: (b, 1, 4, c), recon_track: (b, v, 1, tl, n, 2)
++            self.latent_queue.append(x)
++            x = torch.cat(list(self.latent_queue), dim=1)  # (b, t, 4, c)
++            x = self.temporal_encode(x)  # (b, t, c)
++
++            feat = torch.cat([x[:, -1], rearrange(rec_tracks[:, :, -1, :, :, :], "b v tl n d -> b (v tl n d)")], dim=-1)
++
++            action = self.policy_head.get_action(feat)  # only use the current timestep feature to predict action
++            action = action.detach().cpu()  # (b, act_dim)
++
++        action = action.reshape(-1, *self.act_shape)
++        action = torch.clamp(action, -1, 1)
++        return action.float().cpu().numpy(), (None, rec_tracks[:, :, -1, :, :, :])  # (b, *act_shape)
++
++    def reset(self):
++        self.latent_queue.clear()
++        self.track_obs_queue.clear()
++
++    def save(self, path):
++        torch.save(self.state_dict(), path)
++
++    def load(self, path):
++        self.load_state_dict(torch.load(path, map_location="cpu"))
++
++    def train(self, mode=True):
++        super().train(mode)
++        self.track.eval()
++
++    def eval(self):
++        super().eval()
++        self.track.eval()
++import numpy as np
++from collections import deque
++import robomimic.utils.tensor_utils as TensorUtils
++from omegaconf import OmegaConf
++import torch
++import torch.nn as nn
++import torchvision.transforms as T
++
++from einops import rearrange, repeat
++
++from atm.model import *
++from atm.model.track_patch_embed import TrackPatchEmbed
++from atm.policy.vilt_modules.transformer_modules import *
++from atm.policy.vilt_modules.rgb_modules import *
++from atm.policy.vilt_modules.language_modules import *
++from atm.policy.vilt_modules.extra_state_modules import ExtraModalityTokens
++from atm.policy.vilt_modules.policy_head import *
++from atm.utils.flow_utils import ImageUnNormalize, sample_double_grid, tracks_to_video
++
+ from atm.model.track_transformer import FiLMLayer
+ 
+ ###############################################################################
+@@ -287,7 +877,7 @@ class BCViLTPolicy(nn.Module):
+         
+         return track_encoded
+ 
+-    def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False):
++    def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False, epoch=None, step=None):
+         # 1. encode image
+         img_encoded = []
+         for view_idx in range(self.num_views):
+diff --git a/engine/train_bc.py b/engine/train_bc.py
+index 0c9f83d..f893028 100644
+--- a/engine/train_bc.py
++++ b/engine/train_bc.py
+@@ -21,6 +21,7 @@ from atm.utils.train_utils import setup_optimizer, setup_lr_scheduler, init_wand
+ from atm.utils.log_utils import MetricLogger, BestAvgLoss
+ from atm.utils.env_utils import build_env
+ from engine.utils import rollout, merge_results
++from atm.utils.dims_vars_utils import plot_vars, log_dims_and_vars
+ 
+ 
+ @hydra.main(config_path="../conf/train_bc", version_base="1.3")
+@@ -83,6 +84,7 @@ def main(cfg: DictConfig):
+             cfg.clip_grad,
+             mix_precision=cfg.mix_precision,
+             scheduler=scheduler,
++            epoch=epoch,
+         )
+ 
+         train_metrics["train/lr"] = optimizer.param_groups[0]["lr"]
+@@ -112,6 +114,12 @@ def main(cfg: DictConfig):
+                             % (epoch, "loss", best_loss_logger.best_loss)
+                         )
+                 None if cfg.dry else wandb.log(val_metrics, step=epoch)
++        # Add the plotting function call here
++        if fabric.is_global_zero:
++            if os.path.exists('dims_vars_log.csv'):
++                plot_vars('dims_vars_log.csv', work_dir)
++            else:
++                print("Warning: dims_vars_log.csv not found. Skipping plotting.")
+ 
+         if epoch % cfg.save_freq == 0:
+             model.save(f"{work_dir}/model_{epoch}.ckpt")
+@@ -158,20 +166,41 @@ def run_one_epoch(fabric,
+                   clip_grad=1.0,
+                   mix_precision=False,
+                   scheduler=None,
+-                  ):
++                  epoch=None):
+     """
+     Optimize the policy. Return a dictionary of the loss and any other metrics.
+     """
+     tot_loss_dict, tot_items = {}, 0
+ 
+     model.train()
+-    i = 0
+-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
++    for step, (obs, track_obs, track, task_emb, action, extra_states) in enumerate(tqdm(dataloader)):
+         if mix_precision:
+             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
+             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
+ 
++        # Forward pass
++        with torch.no_grad():
++            model_outputs = model(obs, track_obs, track, task_emb, extra_states)
++
++        # Calculate loss
+         loss, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
++
++        # Extract relevant information for dims_and_vars
++        # Adjust these based on what your model actually returns
++        cls_token = model_outputs[2] if len(model_outputs) > 2 else None
++        track_rep = model_outputs[3] if len(model_outputs) > 3 else None
++
++        # Modified dims_and_vars block
++        dims_and_vars = {}
++        if cls_token is not None:
++            dims_and_vars["cls_token_dim"] = list(cls_token.shape)  # Directly using shape as a list
++            dims_and_vars["cls_token_var"] = cls_token.var().item()
++        if track_rep is not None:
++            dims_and_vars["track_rep_dim"] = list(track_rep.shape)  # Directly using shape as a list
++            dims_and_vars["track_rep_var"] = track_rep.var().item()
++        dims_and_vars["lang_emb_dim"] = list(task_emb.shape)  # Directly using shape as a list
++        dims_and_vars["lang_emb_var"] = task_emb.var().item()
++
+         optimizer.zero_grad()
+         fabric.backward(loss)
+ 
+@@ -185,7 +214,8 @@ def run_one_epoch(fabric,
+             tot_loss_dict[k] += v
+         tot_items += 1
+ 
+-        i += 1
++    # Log dimensions and variances
++    log_dims_and_vars('dims_vars_log.csv', epoch, step, **dims_and_vars)
+ 
+     out_dict = {}
+     for k, v in tot_loss_dict.items():
+@@ -196,7 +226,6 @@ def run_one_epoch(fabric,
+ 
+     return out_dict
+ 
+-
+ @torch.no_grad()
+ def evaluate(model, dataloader, mix_precision=False, tag="val"):
+     tot_loss_dict, tot_items = {}, 0
