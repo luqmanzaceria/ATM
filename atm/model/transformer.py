@@ -4,6 +4,8 @@ from torch import nn, einsum
 
 from einops import rearrange
 
+from atm.model.film import FiLMLayer
+
 def exists(val):
     return val is not None
 
@@ -42,7 +44,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class TransformerAttention(nn.Module):
-    def __init__(self, dim, causal=False, dim_head=None, dim_context=None, heads=8, norm_context=False, dropout=0.1):
+    def __init__(self, dim, causal=False, dim_head=None, dim_context=None, heads=8, norm_context=False, dropout=0.1, use_film=True):
         super().__init__()
         self.heads = heads
         if dim_head is None:
@@ -118,15 +120,22 @@ class Transformer(nn.Module):
                     [
                         TransformerAttention(dim=dim, heads=heads, dropout=attn_dropout, dim_head=dim_head),
                         FeedForward(dim=dim, dropout=ff_dropout)
-                    ]))
+                    ]))self.use_film = use_film
+        if self.use_film:
+            self.film_layers = nn.ModuleList([FiLMLayer(dim, dim) for _ in range(depth)])
 
-    def forward(self, x, cond_fns=None, attn_mask=None):
+    def forward(self, x, language_condition=None, cond_fns=None, attn_mask=None):
+        if self.use_film:
+            assert exists(language_condition), "language_condition must be provided when use_film is True"
+
         if not exists(cond_fns):
             cond_fns = (None,) * len(self.layers) * 2
 
         cond_fns = iter(cond_fns)
 
-        for attn, ff in self.layers:
+        for i, (attn, ff) in enumerate(self.layers):
             x = attn(x, attn_mask=attn_mask, cond_fn=next(cond_fns)) + x
             x = ff(x, cond_fn=next(cond_fns)) + x
+            if self.use_film:
+                x = self.film_layers[i](x, language_condition)
         return x
