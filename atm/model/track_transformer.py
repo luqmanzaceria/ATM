@@ -6,6 +6,12 @@ from einops import rearrange, repeat
 from timm.models.vision_transformer import PatchEmbed
 from torch import nn
 
+import gc
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
 from atm.utils.flow_utils import ImageUnNormalize, tracks_to_video
 from atm.utils.pos_embed_utils import get_1d_sincos_pos_embed, get_2d_sincos_pos_embed
 from atm.policy.vilt_modules.language_modules import *

@@ -8,6 +8,12 @@ import torch.distributed as dist
 import lightning
 from lightning.fabric import Fabric
 
+import gc
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
 import os
 import wandb
 import json

@@ -2,6 +2,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 
+import gc
+
+gc.collect()
+
+torch.cuda.empty_cache()
+
 from einops import rearrange
 
 from atm.model.film import FiLMLayer
