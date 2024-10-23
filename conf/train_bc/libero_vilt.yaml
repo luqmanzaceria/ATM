@@ -25,7 +25,8 @@ num_workers: 8
 val_freq: 5
 save_freq: 10
 clip_grad: 100.
-epochs: 101
+# epochs: 101
+epochs: 2
 seed: 0
 dry: false
 

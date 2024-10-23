@@ -38,7 +38,7 @@ val_path_list = [f"{root_dir}/{suite_name}/{task_dir}/val" for task_dir in task_
 
 track_fn = args.track_transformer or DEFAULT_TRACK_TRANSFORMERS[suite_name]
 
-for seed in range(3):
+for seed in range(1):
     commond = (f'python -m engine.train_bc --config-name={CONFIG_NAME} train_gpus="{train_gpu_ids}" '
                 f'experiment=atm-policy_{suite_name.replace("_", "-")}_demo{NUM_DEMOS} '
                 f'train_dataset="{train_path_list}" val_dataset="{val_path_list}" '
