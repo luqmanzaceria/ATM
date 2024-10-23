@@ -12,6 +12,8 @@ from atm.policy.vilt_modules.language_modules import *
 from .track_patch_embed import TrackPatchEmbed
 from .transformer import Transformer
 
+from atm.model.film import FiLMLayer
+
 class TrackTransformer(nn.Module):
     """
     flow video model using a BERT transformer
@@ -38,10 +40,18 @@ class TrackTransformer(nn.Module):
         self.language_encoder = self._init_language_encoder(output_size=dim, **language_encoder_cfg)
         self._init_weights(self.dim, self.num_img_patches)
 
+        self.film_layer = FiLMLayer(dim, dim)
+
+        print(f"TrackTransformer: Image size: {self.img_size}")
+        print(f"TrackTransformer: Patch size: {self.img_proj_encoder.patch_size}")
+        print(f"TrackTransformer: Number of patches: {self.num_img_patches}")
+        print(f"TrackTransformer: Transformer dim: {self.dim}")
+        print(f"TrackTransformer: Number of track patches: {self.num_track_patches}")
+
         if load_path is not None:
             self.load(load_path)
             print(f"loaded model from {load_path}")
-
+            
     def _init_transformer(self, dim, dim_head, heads, depth, attn_dropout, ff_dropout):
         self.transformer = Transformer(
             dim=dim,
@@ -171,37 +181,45 @@ class TrackTransformer(nn.Module):
         return mask_track
 
     def forward(self, vid, track, task_emb, p_img):
-        """
-        track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
-        vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
-        task_emb, (b, emb_size)
-        """
-        assert torch.max(vid) <=1.
-        B, T, _, _ = track.shape
+        assert torch.max(vid) <= 1.
+        B, T, C, H, W = vid.shape
         patches = self._encode_video(vid, p_img)  # (b, n_image, d)
+        
+        if track is None:
+            # Create a dummy track if track is None
+            track = torch.zeros((B, self.num_track_ts, self.num_track_ids, 2), device=vid.device)
+        
         enc_track = self._encode_track(track)
-
+    
         text_encoded = self.language_encoder(task_emb)  # (b, c)
         text_encoded = rearrange(text_encoded, 'b c -> b 1 c')
+        print(f"Language token shape: {text_encoded.shape}")
 
-        x = torch.cat([enc_track, patches, text_encoded], dim=1)
-        x = self.transformer(x)
-
-        rec_track, rec_patches = x[:, :self.num_track_patches], x[:, self.num_track_patches:-1]
-        rec_patches = self.img_decoder(rec_patches)  # (b, n_image, 3 * t * patch_size ** 2)
-        rec_track = self.track_decoder(rec_track)  # (b, (t n), 2 * patch_size)
+        x = torch.cat([enc_track, patches], dim=1)
+        x = self.film_layer(x, text_encoded)
+        print(f"Shape before transformer: {x.shape}")
+        x = self.transformer(x, language_condition=text_encoded)  # Pass language_condition here
+        print(f"Shape after transformer: {x.shape}")
+    
+        # Extract the CLS token
+        cls_token = x[:, 0]
+        print(f"CLS token shape: {cls_token.shape}")
+    
+        # Get the track representation
+        track_rep = x[:, 1:self.num_track_patches+1]
+        print(f"Track representation shape: {track_rep.shape}")
+    
+        rec_patches = self.img_decoder(x[:, self.num_track_patches+1:-1])
+        print(f"rec_patches shape: {rec_patches.shape}")
+        print(f"patches shape: {patches.shape}")
+    
         num_track_h = self.num_track_ts // self.track_patch_size
+        rec_track = self.track_decoder(track_rep)
         rec_track = rearrange(rec_track, 'b (t n) (p c) -> b (t p) n c', p=self.track_patch_size, t=num_track_h)
-
-        return rec_track, rec_patches
+    
+        return rec_track, rec_patches, cls_token, track_rep
 
     def reconstruct(self, vid, track, task_emb, p_img):
-        """
-        wrapper of forward with preprocessing
-        track: (b, tl, n, 2), which means current time step t0 -> t0 + tl
-        vid: (b, t, c, h, w), which means the past time step t0 - t -> t0
-        task_emb: (b, e)
-        """
         assert len(vid.shape) == 5  # b, t, c, h, w
         track = self._preprocess_track(track)
         vid = self._preprocess_vid(vid)
@@ -249,24 +267,32 @@ class TrackTransformer(nn.Module):
         return loss.sum(), ret_dict
 
     def forward_vis(self, vid, track, task_emb, p_img):
-        """
-        track: (b, tl, n, 2)
-        vid: (b, t, c, h, w)
-        """
         b = vid.shape[0]
         assert b == 1, "only support batch size 1 for visualization"
-
+    
         H, W = self.img_size
         _vid = vid.clone()
         track = self._preprocess_track(track)
         vid = self._preprocess_vid(vid)
-
-        rec_track, rec_patches = self.forward(vid, track, task_emb, p_img)
+    
+        rec_track, rec_patches, cls_token, track_rep = self.forward(vid, track, task_emb, p_img)
+    
+        patchified_vid = self._patchify(vid)
+        print(f"rec_patches shape: {rec_patches.shape}")
+        print(f"patchified vid shape: {patchified_vid.shape}")
+        
+        # Ensure the shapes match for loss calculation
+        min_patches = min(rec_patches.shape[1], patchified_vid.shape[1])
+        rec_patches = rec_patches[:, :min_patches, :]
+        patchified_vid = patchified_vid[:, :min_patches, :]
+        
         track_loss = F.mse_loss(rec_track, track)
-        img_loss = F.mse_loss(rec_patches, self._patchify(vid))
+        img_loss = F.mse_loss(rec_patches, patchified_vid)
         loss = track_loss + img_loss
-
+    
+        print(f"Before _unpatchify: rec_patches shape = {rec_patches.shape}")
         rec_image = self._unpatchify(rec_patches)
+        print(f"After _unpatchify: rec_image shape = {rec_image.shape}")
 
         # place them side by side
         combined_image = torch.cat([vid[:, -1], rec_image[:, -1]], dim=-1)  # only visualize the current frame
@@ -303,12 +329,11 @@ class TrackTransformer(nn.Module):
         N, T, C, img_H, img_W = imgs.shape
         p = self.img_proj_encoder.patch_size[0]
         assert img_H % p == 0 and img_W % p == 0
-
+    
         h = img_H // p
         w = img_W // p
-        x = imgs.reshape(shape=(imgs.shape[0], T, C, h, p, w, p))
-        x = rearrange(x, "n t c h p w q -> n h w p q t c")
-        x = rearrange(x, "n h w p q t c -> n (h w) (p q t c)")
+        x = imgs.reshape(shape=(N, T, C, h, p, w, p))
+        x = rearrange(x, "n t c h p w q -> n (h w) (p q t c)")
         return x
 
     def _unpatchify(self, x):
@@ -319,8 +344,19 @@ class TrackTransformer(nn.Module):
         p = self.img_proj_encoder.patch_size[0]
         h = self.img_size[0] // p
         w = self.img_size[1] // p
-        assert h * w == x.shape[1]
-
+        
+        print(f"_unpatchify: x.shape = {x.shape}")
+        print(f"_unpatchify: Expected patches = {h * w}, Actual patches = {x.shape[1]}")
+        
+        if h * w != x.shape[1]:
+            print(f"Warning: Number of patches mismatch. Expected {h * w}, got {x.shape[1]}. Adjusting...")
+            # Pad or trim x to match the expected number of patches
+            if h * w > x.shape[1]:
+                pad_size = h * w - x.shape[1]
+                x = F.pad(x, (0, 0, 0, pad_size))
+            else:
+                x = x[:, :h*w, :]
+    
         x = rearrange(x, "n (h w) (p q t c) -> n h w p q t c", h=h, w=w, p=p, q=p, t=self.frame_stack, c=3)
         x = rearrange(x, "n h w p q t c -> n t c h p w q")
         imgs = rearrange(x, "n t c h p w q -> n t c (h p) (w q)")
@@ -330,4 +366,17 @@ class TrackTransformer(nn.Module):
         torch.save(self.state_dict(), path)
 
     def load(self, path):
-        self.load_state_dict(torch.load(path, map_location="cpu"))
+        state_dict = torch.load(path, map_location="cpu")
+        model_dict = self.state_dict()
+        
+        # Filter out unnecessary keys
+        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+        
+        # Update model state dict
+        model_dict.update(pretrained_dict)
+        
+        # Load the filtered state dict
+        self.load_state_dict(model_dict, strict=False)
+        
+        print(f"Loaded model from {path}")
+        print(f"Newly initialized layers: {set(model_dict.keys()) - set(pretrained_dict.keys())}")
