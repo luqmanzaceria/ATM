@@ -111,7 +111,7 @@ class TransformerAttention(nn.Module):
         return self.to_out(out)
 
 class Transformer(nn.Module):
-    def __init__(self, dim, dim_head=64, heads=8, depth=6, attn_dropout=0., ff_dropout=0.):
+    def __init__(self, dim, dim_head=64, heads=8, depth=6, attn_dropout=0., ff_dropout=0., use_film=True):
         super().__init__()
         self.layers = nn.ModuleList([])
         for _ in range(depth):
@@ -120,7 +120,8 @@ class Transformer(nn.Module):
                     [
                         TransformerAttention(dim=dim, heads=heads, dropout=attn_dropout, dim_head=dim_head),
                         FeedForward(dim=dim, dropout=ff_dropout)
-                    ]))self.use_film = use_film
+                    ]))
+        self.use_film = use_film
         if self.use_film:
             self.film_layers = nn.ModuleList([FiLMLayer(dim, dim) for _ in range(depth)])
 
