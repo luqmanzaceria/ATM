@@ -48,7 +48,11 @@ def main(cfg: DictConfig):
     val_vis_dataset = BCDataset(dataset_dir=cfg.val_dataset, num_demos=cfg.val_num_demos, vis=True, **cfg.dataset_cfg, aug_prob=0.)
     val_vis_dataloader = get_dataloader(val_vis_dataset, mode="train", num_workers=1, batch_size=1)
 
-    fabric = Fabric(accelerator="cuda", devices=list(cfg.train_gpus), precision="bf16-mixed" if cfg.mix_precision else None, strategy="deepspeed")
+    print(f"Initializing Fabric with accelerator=cuda, devices={cfg.train_gpus}")
+    fabric = Fabric(accelerator="cuda",
+                   devices=list(cfg.train_gpus),
+                   precision="32",
+                   strategy="auto")
     fabric.launch()
 
     None if (cfg.dry or not fabric.is_global_zero) else init_wandb(cfg)
